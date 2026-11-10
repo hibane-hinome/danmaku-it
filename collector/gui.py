@@ -33,7 +33,7 @@ from .fixtures import JPN_AFTER, JPN_BEFORE, load_replay
 from .images import ImageLoader
 from .sender import COLOR_PRESETS, MAX_LEN as SEND_MAX_LEN
 from .sender import DEFAULT_COLOR, MODES, DanmakuSender, SendError
-from .storage import Storage, extract_sc
+from .storage import Storage, extract_sc, read_room_names
 
 TITLE = "弹幕机 · danmaku-it"
 # 图标由 tools/make_icon.py 生成，改图案后重跑那个脚本即可
@@ -784,6 +784,8 @@ class FloatingWindow(QWidget):
         self.cfg = load_gui_config(self.config_path)
         self.theme = resolve_theme(str(self.cfg.get("theme", "dark")))
         self._c = THEME_COLORS[self.theme]
+        # 房间下拉要显示 UP 主名字：历史里连过的房间，collect_room 表里就有
+        self._backfill_room_names()
         self.service = CollectorService()
         self.state = RoomState(input_room=0)
         self._cache_dir = os.path.join(os.path.dirname(self.config_path), "cache")
@@ -1913,6 +1915,8 @@ class FloatingWindow(QWidget):
         )
         self.room_input.lineEdit().setPlaceholderText("房间号")
         self.room_input.lineEdit().returnPressed.connect(self._toggle_connect)
+        # 选中历史项后只把数字留在输入框，名字只在展开的列表里显示
+        self.room_input.activated.connect(self._on_room_activated)
         self.room_input.view().viewport().installEventFilter(self)
         # QSS 无法稳定绘制下拉三角，用透明子标签叠在按钮区上（点击穿透到下拉区域）。
         self.room_arrow = QLabel("▾", self.room_input)
@@ -2174,7 +2178,7 @@ class FloatingWindow(QWidget):
         self.room_input.blockSignals(True)
         self.room_input.clear()
         for room in history:
-            self.room_input.addItem(str(room), room)
+            self.room_input.addItem(self._room_label(room), room)
         if keep_text:
             current = keep_text
         elif self.cfg["rooms"]:
@@ -2185,6 +2189,103 @@ class FloatingWindow(QWidget):
             current = ""
         self.room_input.setEditText(current)
         self.room_input.blockSignals(False)
+        self._fit_room_popup()
+        self._sync_room_tooltip()
+
+    def _fit_room_popup(self) -> None:
+        """下拉弹窗按最长的一项撑开。
+
+        房间框固定 148px，而「22748536 · 火羽ひのめ」比它长，不撑开就被省略号吃掉，
+        名字等于白加。
+        """
+        metrics = self.room_input.fontMetrics()
+        widest = max(
+            (metrics.horizontalAdvance(self.room_input.itemText(i))
+             for i in range(self.room_input.count())),
+            default=0,
+        )
+        self.room_input.view().setMinimumWidth(max(self.room_input.width(), widest + 36))
+
+    def _room_name(self, room: int) -> str:
+        """房间号 → UP 主昵称，没记录过就是空串。"""
+        names = self.cfg.get("room_names") or {}
+        return str(names.get(str(int(room))) or names.get(int(room)) or "")
+
+    def _room_label(self, room: int) -> str:
+        """下拉里显示的文字：号码 · 名字。名字未知时只留号码，别的什么都别编。"""
+        room = int(room)
+        if room == 0:
+            return "0 · 本地测试"
+        name = self._room_name(room)
+        return f"{room} · {name}" if name else str(room)
+
+    def _set_room_name(self, room: int, name: str) -> None:
+        """记住某个房间的 UP 主名字，并刷新下拉里的文字。"""
+        name = (name or "").strip()
+        if not room or not name:
+            return
+        names = dict(self.cfg.get("room_names") or {})
+        if names.get(str(room)) == name:
+            return
+        names[str(room)] = name
+        self.cfg["room_names"] = names
+        self._refresh_room_labels()
+        self._save_config_quiet()
+
+    def _backfill_room_names(self) -> None:
+        """启动时从库里补名字：历史记录里大部分房间都连过，collect_room 有 uname。
+
+        读不到库（路径空、文件不存在、表还没建）就当没有，不影响启动；也不在这里
+        写盘，等下次正常保存配置时一起落下。
+        """
+        try:
+            stored = read_room_names(str(self.cfg.get("database") or ""))
+        except Exception:  # noqa: BLE001 - 只是显示用，不能拖垮启动
+            return
+        if not stored:
+            return
+        merged = {str(room): name for room, name in stored.items()}
+        merged.update({str(k): v for k, v in (self.cfg.get("room_names") or {}).items()})
+        self.cfg["room_names"] = merged
+
+    def _refresh_room_labels(self) -> None:
+        """只改下拉项的文字，不动输入框内容（可能正在手打房间号）。"""
+        kept = self.room_input.currentText()
+        self.room_input.blockSignals(True)
+        for index in range(self.room_input.count()):
+            room = self.room_input.itemData(index)
+            if room is None:
+                continue
+            self.room_input.setItemText(index, self._room_label(int(room)))
+        self.room_input.setEditText(kept)
+        self.room_input.blockSignals(False)
+        self._fit_room_popup()
+        self._sync_room_tooltip()
+
+    def _sync_room_tooltip(self) -> None:
+        base = "可直接输入房间号；下拉列表可右键删除历史记录。填 0 是本地测试（回放 + 试发）"
+        room = self._parse_room(self.room_input.currentText())
+        name = self._room_name(room) if room else ""
+        self.room_input.setToolTip(f"{name}\n{base}" if name else base)
+
+    def _parse_room(self, text: str) -> int | None:
+        """从输入框取房间号，允许 `22748536 · 火羽ひのめ` 这种带名字的写法。"""
+        digits = ""
+        for char in (text or "").strip():
+            if char.isdigit():
+                digits += char
+            elif digits:
+                break
+            elif char not in " ·-—":
+                return None
+        return int(digits) if digits else None
+
+    def _on_room_activated(self, index: int) -> None:
+        room = self.room_input.itemData(index)
+        if room is None:
+            return
+        self.room_input.setEditText(str(int(room)))
+        self._sync_room_tooltip()
 
     def _remember_room(self, room: int) -> None:
         history = [int(value) for value in (self.cfg.get("room_history") or [])]
@@ -2234,11 +2335,10 @@ class FloatingWindow(QWidget):
         self._save_config_quiet()
 
     def _connect(self) -> None:
-        raw = self.room_input.currentText().strip()
-        if not raw.isdigit():
+        room = self._parse_room(self.room_input.currentText())
+        if room is None:
             QMessageBox.warning(self, TITLE, "请输入数字房间号")
             return
-        room = int(raw)
         # 0 号直播间是本地回放 + 本地回显，用来调试发送行
         self._test_mode = room == 0
         self.state = RoomState(input_room=room, state="连接中")
@@ -2523,6 +2623,8 @@ class FloatingWindow(QWidget):
                     else f"0 号直播间 · {self.state.title or '本地测试'}"
                 )
                 if room_no:
+                    # 采集线程把 UP 主昵称一起带回来了，存下来给房间下拉用
+                    self._set_room_name(room_no, event.get("uname") or "")
                     self._append_sys(f"已进入 {room_no} · {self.state.title}")
                     if self.sender.has_login:
                         who = self.sender.uname or "账号"

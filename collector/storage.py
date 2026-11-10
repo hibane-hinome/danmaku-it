@@ -8,6 +8,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Iterable, Iterator
 
 SCHEMA = """
@@ -395,6 +396,31 @@ class Storage:
             )
         ]
         return {"sc_total": total, "deletion_total": deletions, "rooms": rooms}
+
+
+# ---------------- 房间名 ----------------
+
+def read_room_names(db_path: str) -> dict[int, str]:
+    """读 `collect_room` 里「房间号 → UP 主昵称」，给房间下拉显示名字用。
+
+    只读打开：库可能正被采集线程写着，或者路径压根不存在（纯本地试用）。
+    两种情况都返回空表——为了显示一个名字让界面起不来不值得。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True, timeout=3)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT room_id, uname FROM collect_room WHERE uname IS NOT NULL AND uname != ''"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    return {int(room): str(name) for room, name in rows}
 
 
 # ---------------- export ----------------

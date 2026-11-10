@@ -7,6 +7,9 @@ import os
 
 DEFAULTS = {
     "rooms": [],
+    # 界面用：最近连过的房间号，以及「房间号 → UP 主昵称」（下拉里显示名字）
+    "room_history": [],
+    "room_names": {},
     "database": "data/sc.db",
     "log_file": "logs/collector.log",
     "log_level": "INFO",
