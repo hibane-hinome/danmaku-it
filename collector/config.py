@@ -15,15 +15,16 @@ DEFAULTS = {
     "backoff_base_seconds": 1.0,
     "backoff_max_seconds": 60.0,
     "stats_interval_seconds": 60,
-    "cookie_file": "",
-    "sessdata": "",
-    "dede_user_id": "",
+    # 账号目录：这里放多个 cookie 文件，界面会扫出所有能用的账号供切换
+    "cookie_dir": "accounts",
     "record_enter": True,
     "record_events": False,
     "theme": "dark",
     # 发弹幕用：颜色是十进制 RGB（16777215 = 白色），mode 1 滚动 / 4 底部 / 5 顶部
     "send_color": 16777215,
     "send_mode": 1,
+    # 想佩戴的粉丝牌 id，0 = 不切换（按账号当前的佩戴状态发）
+    "send_medal": 0,
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

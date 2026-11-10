@@ -7,8 +7,9 @@ __pycache__/
 .pytest_cache/
 
 # ---- 凭证：绝对不入库 ----
-# account.csv 是 Netscape 格式的 B 站 cookie，19 行里含登录态，泄露等于账号被接管
-account.csv
+# 账号目录里的每个 csv 都是 B 站 cookie（含登录态），泄露等于账号被接管。
+# 整个 *.csv 一律挡掉，避免把新导出的账号顺手提交上去。
+*.csv
 *.cookie
 *.cookies
 

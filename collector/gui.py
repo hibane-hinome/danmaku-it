@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget, QWidgetAction,
 )
 
+from .accounts import account_meta_path, load_meta, save_meta, scan_accounts
 from .bili_api import BiliApi
 from .collector import RoomCollector
 from .config import DEFAULTS
@@ -45,6 +46,8 @@ TICK_MS = 30
 IMAGE_WAIT_SECONDS = 0.4
 MAX_PENDING_DANMAKU = 200
 EMOTE_PX = 20
+# 账号下拉里的头像边长（取 2 倍再缩，缩放后更干净）
+AVATAR_PX = 18
 # 表情面板：按钮尺寸、每行几个、面板宽高
 EMOTICON_BTN = 40
 EMOTICON_COLS = 8
@@ -75,7 +78,16 @@ def load_gui_config(path: str) -> dict:
     config["rooms"] = rooms
 
     base_dir = os.path.dirname(os.path.abspath(path))
-    for key in ("database", "log_file"):
+    # 老配置只有单个 cookie_file，迁到它所在的目录，省得让人手动再填一次
+    if not config.get("cookie_dir"):
+        legacy = config.get("cookie_file") or ""
+        if legacy:
+            legacy = legacy if os.path.isabs(legacy) else os.path.join(base_dir, legacy)
+            config["cookie_dir"] = os.path.dirname(os.path.normpath(legacy))
+    if not config.get("cookie_dir"):
+        config["cookie_dir"] = DEFAULTS["cookie_dir"]
+
+    for key in ("database", "log_file", "cookie_dir"):
         value = config.get(key) or DEFAULTS[key]
         config[key] = value if os.path.isabs(value) else os.path.normpath(os.path.join(base_dir, value))
     config["config_dir"] = base_dir
@@ -703,18 +715,34 @@ class FloatingWindow(QWidget):
         self._c = THEME_COLORS[self.theme]
         self.service = CollectorService()
         self.state = RoomState(input_room=0)
-        self._images = ImageLoader(
-            os.path.join(os.path.dirname(self.config_path), "cache", "images")
+        self._cache_dir = os.path.join(os.path.dirname(self.config_path), "cache")
+        self._images = ImageLoader(os.path.join(self._cache_dir, "images"))
+        # 头像走同一份磁盘缓存，只是尺寸更小
+        self._avatar_images = ImageLoader(
+            os.path.join(self._cache_dir, "images"), max_px=AVATAR_PX * 2
         )
+        # 账号：目录里一个 cookie 文件一个账号，启动先扫一遍（不联网）
+        self._meta_path = account_meta_path(self._cache_dir)
+        self._meta = load_meta(self._meta_path)
+        self.accounts = scan_accounts(self.cfg.get("cookie_dir") or "", self._meta)
+        self.usable = [item for item in self.accounts if not item.error]
+        self._avatar_done: set[str] = set()
+        self._account_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account")
+        self._account_future: Future | None = None
+        # 当前账号的粉丝牌（账号级，不随房间变）
+        self._medals: list[dict] = []
+        self._medal_future: Future | None = None
         # 发弹幕：只读 cookie 不联网，首次发送时再在后台线程 verify
-        self.sender = DanmakuSender(self.cfg)
+        preferred = self._preferred_account()
+        self.sender = DanmakuSender(self.cfg, preferred)
+        self._sender_path = preferred.path if preferred is not None else ""
         self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
         self._send_future: Future | None = None
         self._mode_locked = False  # 房间只开放一种位置时下拉锁死
         self.send_color = int(self.cfg.get("send_color", DEFAULT_COLOR)) & 0xFFFFFF
         # 表情面板单独一份图（要更大的尺寸），磁盘缓存和弹幕列表共用
         self._emote_images = ImageLoader(
-            os.path.join(os.path.dirname(self.config_path), "cache", "images"),
+            os.path.join(self._cache_dir, "images"),
             max_px=EMOTICON_BTN * 2,
         )
         self._emote_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="emote")
@@ -748,6 +776,8 @@ class FloatingWindow(QWidget):
         self._restore_layout()
         self._restore_panes()
         self._restore_geometry()
+        # 昵称/头像走后台，别让启动等网络
+        self._request_account_meta()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
@@ -883,6 +913,7 @@ class FloatingWindow(QWidget):
         splitter.setSizes([340, 170, 150])
         root.addWidget(splitter, 1)
 
+        root.addLayout(self._build_identity_row())
         root.addLayout(self._build_send_row())
 
         grip_row = QHBoxLayout()
@@ -922,6 +953,31 @@ class FloatingWindow(QWidget):
         close_btn.clicked.connect(self.close)
         header.addWidget(close_btn)
         return header
+
+    def _build_identity_row(self) -> QHBoxLayout:
+        """发送身份：用哪个账号发、戴哪个粉丝牌。"""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+
+        self.account_box = QComboBox()
+        self.account_box.setFixedWidth(178)
+        self.account_box.setToolTip("发弹幕用的账号（来自设置里的账号目录）")
+        self.account_box.currentIndexChanged.connect(self._on_account_changed)
+        row.addWidget(self.account_box)
+
+        self.medal_box = QComboBox()
+        self.medal_box.setFixedWidth(170)
+        self.medal_box.setToolTip("发送前先佩戴这个粉丝牌；不切换就按账号当前状态发")
+        self.medal_box.currentIndexChanged.connect(self._on_medal_changed)
+        row.addWidget(self.medal_box)
+
+        row.addStretch(1)
+
+        # 账号和牌子的状态都在构造完控件后才能填，这里先压一次，避免闪空下拉
+        self._populate_accounts()
+        self._fill_medal_box()
+        return row
 
     def _build_send_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -970,6 +1026,222 @@ class FloatingWindow(QWidget):
         self.send_btn.setToolTip(self._send_hint())
         row.addWidget(self.send_btn)
         return row
+
+    # ----- 账号 -----
+
+    def _preferred_account(self):
+        """优先用上次选的那个账号，否则用目录里第一个可用的。"""
+        path = str(self.cfg.get("account_path") or "")
+        for account in self.usable:
+            if account.path == path:
+                return account
+        return self.usable[0] if self.usable else None
+
+    def _current_account(self):
+        path = self.account_box.currentData()
+        for account in self.usable:
+            if account.path == path:
+                return account
+        return self._preferred_account()
+
+    def _populate_accounts(self) -> None:
+        """把扫到的账号填进下拉；昵称还没验证出来时先显示文件名。"""
+        preferred = str(self.cfg.get("account_path") or "")
+        self.account_box.blockSignals(True)
+        self.account_box.clear()
+        for account in self.usable:
+            self.account_box.addItem(account.display, account.path)
+            index = self.account_box.count() - 1
+            tip = account.path if account.display == account.label else f"{account.label}\n{account.path}"
+            self.account_box.setItemData(index, tip, Qt.ToolTipRole)
+
+        if not self.usable:
+            self.account_box.addItem("未找到账号", "")
+            self.account_box.setEnabled(False)
+            self.account_box.setToolTip(
+                f"账号目录里没有可用的 cookie 文件：{self.cfg.get('cookie_dir') or '（未设置）'}"
+            )
+        else:
+            self.account_box.setEnabled(True)
+            self.account_box.setToolTip("发弹幕用的账号（来自设置里的账号目录）")
+            index = self.account_box.findData(preferred)
+            self.account_box.setCurrentIndex(index if index >= 0 else 0)
+        self.account_box.blockSignals(False)
+
+    def _on_account_changed(self, _index: int = -1) -> None:
+        account = self._current_account()
+        if account is not None and account.path != str(self.cfg.get("account_path") or ""):
+            self.cfg["account_path"] = account.path
+            self._save_config_quiet()
+        self._use_account(account)
+
+    def _use_account(self, account) -> None:
+        """换成这个账号：重建发送器，表情包、可用颜色、粉丝牌全部作废重拉。"""
+        self.sender = DanmakuSender(self.cfg, account)
+        self._sender_path = account.path if account is not None else ""
+        self._emote_room = 0
+        self._emote_packages = []
+        self._emote_message = ""
+        self._send_options = None
+        self._mode_locked = False
+        self._medals = []
+        self._fill_medal_box()
+        self._refresh_send_state()
+        if self.state.real_room:
+            self._refresh_room_context(force=True)
+            self._request_medals()
+        self._request_account_meta()
+
+    def _request_account_meta(self) -> None:
+        """后台补昵称和头像；缓存还新鲜的账号不问 B 站。"""
+        if self._account_future is not None or not self.usable:
+            return
+        pending = [item for item in self.usable if not item.meta_is_fresh(self._meta)]
+        if not pending:
+            return
+        self._account_future = self._account_pool.submit(self._verify_accounts, pending)
+
+    def _verify_accounts(self, accounts: list) -> list[tuple[str, str, str, int, bool]]:
+        """后台线程：逐个账号问一次 nav，绝不碰控件。"""
+        out: list[tuple[str, str, str, int, bool]] = []
+        for account in accounts:
+            sender = DanmakuSender(self.cfg, account)
+            ok, _info = sender.verify()
+            out.append((account.path, sender.uname, sender.face, sender.uid, ok))
+        return out
+
+    def _poll_account_meta(self) -> None:
+        if self._account_future is None or not self._account_future.done():
+            return
+        future, self._account_future = self._account_future, None
+        try:
+            results = future.result()
+        except Exception:  # noqa: BLE001 - 补资料失败不该影响发弹幕
+            return
+
+        by_path = {item.path: item for item in self.usable}
+        changed = False
+        for path, uname, face, uid, ok in results:
+            account = by_path.get(path)
+            if account is None or not ok or not uname:
+                continue
+            account.uname, account.face, account.uid = uname, face, uid
+            account.store_meta(self._meta)
+            changed = True
+        if not changed:
+            return
+
+        save_meta(self._meta_path, self._meta)
+        # 补资料的是当前账号时，顺手把发送器上的名字同步过去，tooltip 才不会一直显示空
+        current = self._current_account()
+        if current is not None and current.path == self._sender_path:
+            self.sender.uname = current.uname
+            self.sender.face = current.face
+            self.sender.uid = current.uid
+        self.account_box.blockSignals(True)
+        for index, account in enumerate(self.usable):
+            if index < self.account_box.count():
+                self.account_box.setItemText(index, account.display)
+        self.account_box.blockSignals(False)
+        self._avatar_done.clear()
+        self._refresh_avatars()
+        self._refresh_send_state()
+
+    def _refresh_avatars(self) -> None:
+        """头像下完就贴到下拉项上；没下完的先登记，下一轮再看。"""
+        for index, account in enumerate(self.usable):
+            url = account.face
+            if not url or url in self._avatar_done or index >= self.account_box.count():
+                continue
+            if not self._avatar_images.settled(url):
+                self._avatar_images.want(url)
+                continue
+            image = self._avatar_images.image(url)
+            if image is not None and not image.isNull():
+                self.account_box.setItemIcon(index, QIcon(QPixmap.fromImage(image)))
+            self._avatar_done.add(url)
+
+    # ----- 粉丝牌 -----
+
+    def _request_medals(self) -> None:
+        if self._medal_future is not None:
+            return
+        if not self.sender.has_login:
+            self._medals = []
+            self._fill_medal_box()
+            return
+        if self._medals:
+            # 牌子是账号级的，换房间只会影响「本房间」标注，重填就行
+            self._fill_medal_box()
+            return
+        self._fill_medal_box(loading=True)
+        self._medal_future = self._account_pool.submit(self.sender.fetch_medals)
+
+    def _poll_medals(self) -> None:
+        if self._medal_future is None or not self._medal_future.done():
+            return
+        future, self._medal_future = self._medal_future, None
+        try:
+            self._medals = future.result()
+        except SendError as exc:
+            self._medals = []
+            self._append_sys(f"粉丝牌列表拉取失败：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 拉不到牌子不影响发弹幕
+            self._medals = []
+            self._append_sys(f"粉丝牌列表拉取失败：{type(exc).__name__}: {exc}")
+        self._fill_medal_box()
+
+    def _fill_medal_box(self, *, loading: bool = False) -> None:
+        keep = int(self.cfg.get("send_medal") or 0)
+        self.medal_box.blockSignals(True)
+        self.medal_box.clear()
+        if loading:
+            self.medal_box.addItem("拉取粉丝牌…", 0)
+            self.medal_box.setEnabled(False)
+            self.medal_box.setToolTip("正在拉取该账号的粉丝牌")
+        elif not self.state.real_room:
+            self.medal_box.addItem("连接后可选牌子", 0)
+            self.medal_box.setEnabled(False)
+            self.medal_box.setToolTip("粉丝牌按账号查询，连上直播间再选")
+        elif not self._medals:
+            self.medal_box.addItem("无粉丝牌", 0)
+            self.medal_box.setEnabled(False)
+            self.medal_box.setToolTip("该账号没有粉丝牌，发的弹幕不会带牌子")
+        else:
+            self.medal_box.addItem("不切换牌子", 0)
+            room = self.state.real_room
+            for medal in self._medals:
+                here = room and medal["room_id"] == room
+                self.medal_box.addItem(
+                    f"{medal['name']} Lv{medal['level']}" + ("（本房间）" if here else ""),
+                    medal["medal_id"],
+                )
+                self.medal_box.setItemData(
+                    self.medal_box.count() - 1,
+                    f"{medal['anchor']} · 房间 {medal['room_id']}",
+                    Qt.ToolTipRole,
+                )
+            index = self.medal_box.findData(keep)
+            self.medal_box.setCurrentIndex(index if index >= 0 else 0)
+            self.medal_box.setEnabled(True)
+            self.medal_box.setToolTip(
+                f"账号共 {len(self._medals)} 枚粉丝牌；选了会在发送前先佩戴它。\n"
+                "注意：佩戴是全局状态，网页端也会跟着变；而在这个房间发弹幕时，"
+                "B 站固定显示你在这个主播的牌子，切换改不了它"
+            )
+        self.medal_box.blockSignals(False)
+
+    def _on_medal_changed(self) -> None:
+        medal_id = int(self.medal_box.currentData() or 0)
+        if int(self.cfg.get("send_medal") or 0) == medal_id:
+            return
+        self.cfg["send_medal"] = medal_id
+        self._save_config_quiet()
+
+    def _selected_medal(self) -> int:
+        if not self.medal_box.isEnabled():
+            return 0
+        return int(self.medal_box.currentData() or 0)
 
     # ----- 发送选项：位置 / 颜色 -----
 
@@ -1233,21 +1505,31 @@ class FloatingWindow(QWidget):
         if not self.state.real_room:
             return "先连接直播间才能发弹幕（避免发错房间）"
         if not self.sender.has_login:
-            return "未配置 cookie（config.json 的 cookie_file），只能收不能发"
-        who = f"以 {self.sender.uname} 的身份发送" if self.sender.uname else "用 cookie 对应的账号发送"
+            return "账号目录里没有可用账号：设置里指定目录，放入导出的 cookie 文件"
+        who = f"以 {self.sender.uname} 的身份发送" if self.sender.uname else "用当前账号发送"
         return f"{who}；B 站限制 {SEND_MAX_LEN} 字、约 5 秒一条"
 
     def _reload_sender(self) -> None:
-        """设置里改过 cookie 后重建发送器，不必重启。"""
-        self.sender = DanmakuSender(self.cfg)
-        # 换账号意味着表情包和可用颜色都可能完全不同，缓存作废，重新拉
-        self._emote_room = 0
-        self._emote_packages = []
-        self._emote_message = ""
-        self._send_options = None
-        self._mode_locked = False
-        self._refresh_send_state()
-        self.send_btn.setToolTip(self._send_hint())
+        """设置里改过账号目录后重扫一遍，不必重启。"""
+        self.accounts = scan_accounts(self.cfg.get("cookie_dir") or "", self._meta)
+        self.usable = [item for item in self.accounts if not item.error]
+        self._avatar_done.clear()
+        self._populate_accounts()
+        self._use_account(self._current_account())
+
+        broken = [item for item in self.accounts if item.error]
+        if broken:
+            self._append_sys(
+                "这些文件没被当成账号："
+                + "、".join(f"{item.label}（{item.error}）" for item in broken)
+            )
+        if self.usable:
+            self._append_sys(f"账号目录已加载 {len(self.usable)} 个账号")
+        else:
+            self._append_sys(
+                f"账号目录里没找到可用的 cookie 文件：{self.cfg.get('cookie_dir')}"
+            )
+        self._request_account_meta()
 
     def _send_room(self) -> int:
         """发送目标：只认已经连上的真实房间号。
@@ -1259,14 +1541,17 @@ class FloatingWindow(QWidget):
         return self.state.real_room
 
     def _refresh_send_state(self) -> None:
-        """按「是否已连上房间」开关整条发送行。"""
-        ready = bool(self.state.real_room)
+        """按「已连上房间」和「有可用账号」两个条件开关整条发送行。"""
+        room_ready = bool(self.state.real_room)
+        ready = room_ready and self.sender.has_login
         busy = self._send_future is not None
-        self.send_input.setPlaceholderText(
-            f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）"
-            if ready
-            else "先连接直播间，才能发弹幕"
-        )
+        if not room_ready:
+            placeholder = "先连接直播间，才能发弹幕"
+        elif not self.sender.has_login:
+            placeholder = "账号目录里没有可用账号"
+        else:
+            placeholder = f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）"
+        self.send_input.setPlaceholderText(placeholder)
         for widget in (self.send_input, self.emote_btn, self.color_btn):
             widget.setEnabled(ready)
         self.mode_box.setEnabled(ready and not self._mode_locked)
@@ -1295,33 +1580,47 @@ class FloatingWindow(QWidget):
         self.send_btn.setText("发送中…")
         self._send_future = self._send_pool.submit(
             self._send_worker, room, msg, self.send_color, self._send_mode(), dm_type,
-            display or msg,
+            display or msg, self._selected_medal(),
         )
 
     def _send_worker(
-        self, room: int, msg: str, color: int, mode: int, dm_type: int, display: str
-    ) -> tuple[bool, str]:
-        """在后台线程发，绝不碰界面；返回 ``(成功?, 用于提示的文本/错误)``。"""
+        self,
+        room: int,
+        msg: str,
+        color: int,
+        mode: int,
+        dm_type: int,
+        display: str,
+        medal_id: int,
+    ) -> tuple[bool, str, str]:
+        """在后台线程发，绝不碰界面；返回 ``(成功?, 提示文本/错误, 附注)``。"""
+        note = ""
         try:
             if not self.sender.uname:
                 ok, info = self.sender.verify()
                 if not ok:
-                    return False, info
+                    return False, info, ""
+            # 选了牌子就先戴：佩戴是全局状态，戴不上不该拦住这条弹幕，只记一笔
+            if medal_id and self.sender.worn_medal != medal_id:
+                try:
+                    self.sender.wear_medal(medal_id)
+                except SendError as exc:
+                    note = f"（粉丝牌没戴上：{exc}）"
             self.sender.send(room, msg, color=color, mode=mode, dm_type=dm_type)
-            return True, display
+            return True, display, note
         except SendError as exc:
-            return False, str(exc)
+            return False, str(exc), ""
         except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
-            return False, f"{type(exc).__name__}: {exc}"
+            return False, f"{type(exc).__name__}: {exc}", ""
 
     def _poll_send(self) -> None:
         if self._send_future is None or not self._send_future.done():
             return
         future, self._send_future = self._send_future, None
         try:
-            ok, payload = future.result()
+            ok, payload, note = future.result()
         except Exception as exc:  # noqa: BLE001 - worker 之外的意外，也要回到可发送状态
-            ok, payload = False, f"{type(exc).__name__}: {exc}"
+            ok, payload, note = False, f"{type(exc).__name__}: {exc}", ""
 
         self.send_btn.setText("发送")
         # 恢复可用性：是否连上、是否还在发，都以真实状态为准
@@ -1332,6 +1631,8 @@ class FloatingWindow(QWidget):
                 self.send_input.clear()
             self.send_btn.setText("已发送")
             QTimer.singleShot(1200, lambda: self.send_btn.setText("发送"))
+            if note:
+                self._append_sys(f"已发送{note}：{payload}")
         else:
             self._append_sys(f"发送失败：{payload}")
 
@@ -1987,12 +2288,16 @@ class FloatingWindow(QWidget):
         self.connect_btn.setEnabled(True)
         self.room_input.setEnabled(not running)
         self._refresh_send_state()
+        self._fill_medal_box()
 
     # ----- event pump -----
 
     def _tick(self) -> None:
         self._poll_send()
         self._poll_room_context()
+        self._poll_account_meta()
+        self._poll_medals()
+        self._refresh_avatars()
 
         batch: list[dict] = []
         for _ in range(MAX_EVENTS_PER_TICK):
@@ -2023,6 +2328,7 @@ class FloatingWindow(QWidget):
                 self.title_label.setText(self.state.title or TITLE)
                 self._append_sys(f"已进入 {self.state.real_room} · {self.state.title}")
                 self._refresh_send_state()
+                self._request_medals()
             elif kind == "sys":
                 self._append_sys(str(event.get("text") or ""))
             elif kind == "status":
@@ -2446,6 +2752,8 @@ class FloatingWindow(QWidget):
         self._emote_images.stop()
         self._send_pool.shutdown(wait=False)
         self._emote_pool.shutdown(wait=False, cancel_futures=True)
+        self._account_pool.shutdown(wait=False, cancel_futures=True)
+        self._avatar_images.stop()
         if self._emoticon_panel is not None:
             self._emoticon_panel.close()
         self.cfg["split"] = self._layout_sizes()
@@ -2529,18 +2837,9 @@ class Dialog(QDialog):
         self.theme_box.setCurrentIndex(index if index >= 0 else 0)
         form.addRow("主题", self.theme_box)
 
-        self.sessdata = QLineEdit(str(cfg.get("sessdata", "")))
-        self.sessdata.setEchoMode(QLineEdit.Password)
-        self.sessdata.setPlaceholderText("留空则沿用 Cookie 文件；两者都空为匿名")
-        form.addRow("SESSDATA", self.sessdata)
-
-        self.dede_user_id = QLineEdit(str(cfg.get("dede_user_id", "")))
-        self.dede_user_id.setPlaceholderText("必须与 SESSDATA 属于同一账号")
-        form.addRow("DedeUserID", self.dede_user_id)
-
-        self.cookie_file = QLineEdit(str(cfg.get("cookie_file", "")))
-        self.cookie_file.setPlaceholderText("可选：浏览器导出的 cookie 文件路径")
-        form.addRow("Cookie 文件", self.cookie_file)
+        self.cookie_dir = QLineEdit(str(cfg.get("cookie_dir", "")))
+        self.cookie_dir.setPlaceholderText("放 cookie 文件的目录，可以放多个 csv，启动时自动扫描")
+        form.addRow("账号目录", self._with_dir_browse(self.cookie_dir))
 
         self.topmost = QCheckBox("窗口置顶")
         self.topmost.setChecked(owner.pin_btn.isChecked())
@@ -2583,18 +2882,43 @@ class Dialog(QDialog):
         row.addWidget(button)
         return holder
 
+    def _with_dir_browse(self, entry: QLineEdit) -> QWidget:
+        """目录选择：账号目录是「一整个文件夹」，不是单个文件。"""
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(entry, 1)
+        button = QPushButton("浏览")
+        button.setObjectName("plain")
+
+        def browse() -> None:
+            path = QFileDialog.getExistingDirectory(
+                self, "选择账号目录", entry.text() or os.path.dirname(self.owner.config_path)
+            )
+            if path:
+                entry.setText(path)
+
+        button.clicked.connect(browse)
+        row.addWidget(button)
+        return holder
+
     def _save(self) -> None:
         owner = self.owner
         theme = str(self.theme_box.currentData())
+        # 目录也按 config 所在目录解析，和 database / log_file 一致
+        cookie_dir = self.cookie_dir.text().strip()
+        if cookie_dir and not os.path.isabs(cookie_dir):
+            cookie_dir = os.path.normpath(
+                os.path.join(os.path.dirname(owner.config_path), cookie_dir)
+            )
         owner.cfg.update({
             "database": self.db.text().strip(),
             "log_file": self.log.text().strip(),
             "heartbeat_seconds": self.heartbeat.value(),
             "backoff_max_seconds": self.backoff.value(),
             "log_level": self.level.currentText(),
-            "sessdata": self.sessdata.text().strip(),
-            "dede_user_id": self.dede_user_id.text().strip(),
-            "cookie_file": self.cookie_file.text().strip(),
+            "cookie_dir": cookie_dir,
             "theme": theme,
         })
         owner.danmaku.document().setMaximumBlockCount(self.max_blocks.value())

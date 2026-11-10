@@ -5,9 +5,12 @@
 - ``SESSDATA``   —— 身份凭证
 - ``bili_jct``   —— CSRF token，发弹幕时同时作为 ``csrf`` 与 ``csrf_token`` 传
 
-两者都从 config 的 ``cookie_file``（浏览器导出的 cookie 文件）或 ``sessdata``
-字段取。cookie 文件里没有 ``bili_jct`` 时，用 SESSDATA 找 passport 换一次
-（B 站会随 ``Set-Cookie`` 下发），所以只导出了 SESSDATA 也能发。
+凭证来自账号目录里的某个 cookie 文件（界面挑哪个就用哪个），构造时把
+``Account`` 传进来即可。cookie 里没有 ``bili_jct`` 时用 SESSDATA 找 passport
+换一次（B 站会随 ``Set-Cookie`` 下发），所以只导出了 SESSDATA 也能发。
+
+除了发弹幕，这个模块还包了「按账号拉表情包 / 可用颜色位置 / 粉丝牌 / 佩戴
+粉丝牌」这些发一条弹幕真正需要的东西。
 
 这个模块**不碰 Qt**，界面自己在后台线程里调用，避免网络卡住画面。
 """
@@ -31,6 +34,13 @@ EMOTICON_URL = (
 # 当前账号在这个房间**真正**能用的颜色和位置。房间可以限制彩色/顶部弹幕，
 # 此时发弹幕接口不报错，只是悄悄按白色滚动下发，所以必须先问这个接口
 DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigByGroup?room_id={room}"
+# 账号拥有的全部粉丝牌。page_size 上限 10，传大了直接回 -1002002 参数异常
+MEDAL_LIST_URL = (
+    "https://api.live.bilibili.com/xlive/app-ucenter/v1/user/GetMyMedals"
+    "?page={page}&page_size=10"
+)
+# 佩戴粉丝牌（全局状态，戴哪个所有直播间都显示哪个）
+WEAR_MEDAL_URL = "https://api.live.bilibili.com/xlive/web-room/v1/fansMedal/wear"
 
 # 单条弹幕上限（B 站按字符计）
 MAX_LEN = 20
@@ -123,17 +133,27 @@ def load_cookies(path: str) -> dict[str, str]:
 
 
 class DanmakuSender:
-    """用配置里的 cookie 往指定直播间发弹幕。线程安全，可反复调用。"""
+    """用某个账号的 cookie 往指定直播间发弹幕。线程安全，可反复调用。"""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, account=None) -> None:
         self._ua = config.get("user_agent") or DEFAULT_UA
         self._cookies: dict[str, str] = {}
         self._jct = ""
         self._lock = threading.Lock()
         self._last_sent = 0.0
         self.uname = ""
+        self.face = ""
         self.uid = 0
-        self._load(config)
+        # 已经佩戴的牌子，避免每条弹幕都去 wear 一次
+        self.worn_medal = 0
+        if account is not None:
+            self._cookies = dict(account.cookies)
+            self.uname = account.uname
+            self.face = account.face
+            self.uid = account.uid
+            self._jct = self._cookies.get("bili_jct") or ""
+        else:
+            self._load(config)
 
     # ----- 凭证 -----
 
@@ -143,12 +163,6 @@ class DanmakuSender:
             # config.py 只帮忙解析 database 与 log_file，path 类字段要自己补
             path = os.path.normpath(os.path.join(config.get("config_dir") or ".", path))
         self._cookies = load_cookies(path)
-
-        if config.get("sessdata"):
-            self._cookies.setdefault("SESSDATA", str(config["sessdata"]).strip())
-        if config.get("dede_user_id"):
-            self._cookies.setdefault("DedeUserID", str(config["dede_user_id"]).strip())
-
         self._jct = self._cookies.get("bili_jct") or ""
 
     @property
@@ -226,6 +240,7 @@ class DanmakuSender:
             return False, "cookie 已失效，请重新导出"
         self.uname = str(data.get("uname") or "")
         self.uid = int(data.get("mid") or 0)
+        self.face = str(data.get("face") or "")
         if not self._jct:
             self.refresh_csrf()
         if not self._jct:
@@ -369,6 +384,86 @@ class DanmakuSender:
         # 房间专属排前面：最常用的就是它们
         packages.sort(key=lambda pkg: 0 if pkg["type"] == 2 else pkg["type"])
         return packages
+
+    # ----- 粉丝牌 -----
+
+    def fetch_medals(self) -> list[dict]:
+        """账号拥有的全部粉丝牌（翻页拿全）。
+
+        返回 ``[{"medal_id", "name", "level", "anchor", "room_id"}]``，按等级
+        从高到低排。发弹幕时佩戴哪个牌子是**全局**状态：戴 `锦依卫` 之后
+        在别的房间发弹幕也带这个牌子，所以界面要让人自己选。
+        """
+        medals: list[dict] = []
+        page = 1
+        while page <= 20:  # 正常账号不会超过 20 页，防接口异常时死循环
+            try:
+                payload = self._get_json(
+                    MEDAL_LIST_URL.format(page=page), "https://live.bilibili.com/"
+                )
+            except Exception as exc:  # noqa: BLE001 - 界面只关心成不成
+                raise SendError(f"拉粉丝牌失败：{exc}") from exc
+
+            code = payload.get("code")
+            if code not in (0, None):
+                raise SendError(
+                    payload.get("message") or f"拉粉丝牌失败（code={code}）", code
+                )
+
+            data = payload.get("data") or {}
+            items = data.get("items") or []
+            for raw in items:
+                try:
+                    medal_id = int(raw.get("medal_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not medal_id:
+                    continue
+                medals.append(
+                    {
+                        "medal_id": medal_id,
+                        "name": str(raw.get("medal_name") or ""),
+                        "level": int(raw.get("level") or 0),
+                        "anchor": str(raw.get("target_name") or ""),
+                        "room_id": int(raw.get("roomid") or 0),
+                    }
+                )
+
+            total = int((data.get("page_info") or {}).get("total_page") or 0)
+            if not items or page >= total:
+                break
+            page += 1
+
+        medals.sort(key=lambda item: item["level"], reverse=True)
+        return medals
+
+    def wear_medal(self, medal_id: int) -> None:
+        """佩戴指定粉丝牌。``medal_id`` 传 0 表示不佩戴。"""
+        if not self.has_login:
+            raise SendError("未配置 cookie，无法佩戴粉丝牌")
+        if not self._jct and not self.refresh_csrf():
+            raise SendError("缺少 CSRF token，请重新导出 cookie（需要 bili_jct）")
+
+        body = urllib.parse.urlencode(
+            {
+                "medal_id": str(int(medal_id)),
+                "csrf": self._jct,
+                "csrf_token": self._jct,
+            }
+        ).encode("utf-8")
+        try:
+            payload = self._post_json(
+                WEAR_MEDAL_URL, body, "https://live.bilibili.com/"
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一包装成 SendError 给界面
+            raise SendError(f"切换粉丝牌失败：{exc}") from exc
+
+        code = payload.get("code")
+        if code not in (0, None):
+            raise SendError(
+                payload.get("message") or f"切换粉丝牌失败（code={code}）", code
+            )
+        self.worn_medal = int(medal_id)
 
     # ----- 颜色 / 位置可用性 -----
 

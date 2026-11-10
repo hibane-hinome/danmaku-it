@@ -77,11 +77,10 @@ async def _run_async(config: dict) -> int:
                 pass
 
     storage = Storage(config["database"])
+    # 采集是匿名的：这里只在老配置手写了 cookie_file 时才带上，正常情况下不回退到账号目录
     api = BiliApi(
         user_agent=config["user_agent"],
         cookie_file=config.get("cookie_file", ""),
-        sessdata=config.get("sessdata", ""),
-        dede_user_id=config.get("dede_user_id", ""),
     )
     collectors = [
         RoomCollector(

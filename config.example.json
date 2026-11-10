@@ -8,13 +8,12 @@
   "backoff_base_seconds": 1.0,
   "backoff_max_seconds": 60.0,
   "stats_interval_seconds": 60,
-  "cookie_file": "",
-  "sessdata": "",
-  "dede_user_id": "",
+  "cookie_dir": "accounts",
   "record_enter": true,
   "record_events": false,
   "theme": "dark",
   "send_color": 16777215,
   "send_mode": 1,
+  "send_medal": 0,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
