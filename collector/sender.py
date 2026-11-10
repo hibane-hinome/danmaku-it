@@ -42,10 +42,12 @@ MEDAL_LIST_URL = (
 # 佩戴粉丝牌（全局状态，戴哪个所有直播间都显示哪个）
 WEAR_MEDAL_URL = "https://api.live.bilibili.com/xlive/web-room/v1/fansMedal/wear"
 
-# 单条弹幕上限（B 站按字符计）
-MAX_LEN = 20
-# 同一账号两次发送的最小间隔，服务端约 5 秒，本地先挡一层避免无谓报错
-MIN_INTERVAL = 5.0
+# 单条弹幕上限，B 站按字符计（不是字节）：实测 80 个汉字或 80 个 ASCII 都能发，
+# 81 个回 1003212。房间的 dm_config 里也写着 80。
+MAX_LEN = 80
+# 同一账号两次发送的最小间隔。实测服务端只要求约 1 秒：间隔 1.0 秒连发 4 条全部
+# code=0，压到 0.5 秒才会回 10030「发送弹幕的频率过快」。本地按 1 秒挡一层。
+MIN_INTERVAL = 1.0
 
 # 弹幕位置，对应发弹幕接口的 mode 字段
 MODE_SCROLL = 1
@@ -79,7 +81,8 @@ _CODE_HINTS = {
     -111: "CSRF 校验失败，cookie 不完整",
     -403: "没有发言权限（可能被禁言、等级不足或需要粉丝牌）",
     -400: "请求被服务端拒绝",
-    1003212: "弹幕太长，服务端限制 20 字",
+    10030: "发太快了，B 站要求间隔约 1 秒",
+    1003212: "弹幕太长，上限 80 个字符",
 }
 
 
@@ -390,8 +393,11 @@ class DanmakuSender:
     def fetch_medals(self) -> list[dict]:
         """账号拥有的全部粉丝牌（翻页拿全）。
 
-        返回 ``[{"medal_id", "name", "level", "anchor", "room_id"}]``，按等级
-        从高到低排。发弹幕时佩戴哪个牌子是**全局**状态：戴 `锦依卫` 之后
+        返回 ``[{"medal_id", "name", "level", "anchor", "room_id", "wearing"}]``，
+        按等级从高到低排。``wearing`` 表示当前全局佩戴的那枚（接口的
+        ``status == 1``），界面拿它做默认值。
+
+        发弹幕时佩戴哪个牌子是**全局**状态：戴 `锦依卫` 之后
         在别的房间发弹幕也带这个牌子，所以界面要让人自己选。
         """
         medals: list[dict] = []
@@ -426,6 +432,8 @@ class DanmakuSender:
                         "level": int(raw.get("level") or 0),
                         "anchor": str(raw.get("target_name") or ""),
                         "room_id": int(raw.get("roomid") or 0),
+                        # status=1 就是账号现在戴着的这枚
+                        "wearing": int(raw.get("status") or 0) == 1,
                     }
                 )
 

@@ -35,7 +35,10 @@ from .sender import COLOR_PRESETS, MAX_LEN as SEND_MAX_LEN
 from .sender import DEFAULT_COLOR, MODES, DanmakuSender, SendError
 from .storage import Storage, export_csv, export_ndjson, extract_sc
 
-TITLE = "SC Collector · 外挂弹幕机"
+TITLE = "弹幕机 · danmaku-it"
+# 图标由 tools/make_icon.py 生成，改图案后重跑那个脚本即可
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+ICON_PATH = os.path.join(ASSETS_DIR, "icon.ico")
 MAX_DANMAKU_BLOCKS = 600
 MAX_EVENT_BLOCKS = 200
 MAX_SC_BLOCKS = 600
@@ -752,6 +755,7 @@ class FloatingWindow(QWidget):
         self._emote_message = ""
         self._send_options: dict | None = None
         self._emoticon_panel: EmoticonPanel | None = None
+        self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
         self._drag_origin: QPoint | None = None
@@ -765,6 +769,7 @@ class FloatingWindow(QWidget):
         self._mock_stop: threading.Event | None = None
 
         self.setWindowTitle(TITLE)
+        self.setWindowIcon(QIcon(ICON_PATH))
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(560, 640)
@@ -812,14 +817,16 @@ class FloatingWindow(QWidget):
             f"QSplitter::handle {{ background: {colors['split']}; }}"
         )
         self._shadow.setColor(QColor(*colors["shadow"]))
-        if hasattr(self, "room_arrow"):
-            self.room_arrow.setStyleSheet(
-                f"color:{colors['arrow']}; background:transparent; font-size:13px;"
-            )
-        if hasattr(self, "mode_arrow"):
-            self.mode_arrow.setStyleSheet(
-                f"color:{colors['arrow']}; background:transparent; font-size:11px;"
-            )
+        for arrow in (
+            getattr(self, "room_arrow", None),
+            getattr(self, "account_arrow", None),
+            getattr(self, "medal_arrow", None),
+            getattr(self, "mode_arrow", None),
+        ):
+            if arrow is not None:
+                arrow.setStyleSheet(
+                    f"color:{colors['arrow']}; background:transparent; font-size:11px;"
+                )
         for handle in self._drag_handles.values():
             handle.setStyleSheet(
                 f"QLabel#grip {{ color: {colors['grip']}; font-size: 12px; }}"
@@ -965,12 +972,14 @@ class FloatingWindow(QWidget):
         self.account_box.setToolTip("发弹幕用的账号（来自设置里的账号目录）")
         self.account_box.currentIndexChanged.connect(self._on_account_changed)
         row.addWidget(self.account_box)
+        self.account_arrow = self._combo_arrow(self.account_box)
 
         self.medal_box = QComboBox()
-        self.medal_box.setFixedWidth(170)
-        self.medal_box.setToolTip("发送前先佩戴这个粉丝牌；不切换就按账号当前状态发")
+        self.medal_box.setFixedWidth(186)
+        self.medal_box.setToolTip("默认是账号当前戴着的牌子；换一个会在发送前切过去")
         self.medal_box.currentIndexChanged.connect(self._on_medal_changed)
         row.addWidget(self.medal_box)
+        self.medal_arrow = self._combo_arrow(self.medal_box)
 
         row.addStretch(1)
 
@@ -979,13 +988,25 @@ class FloatingWindow(QWidget):
         self._fill_medal_box()
         return row
 
+    def _combo_arrow(self, combo: QComboBox) -> QLabel:
+        """给下拉框贴一个自绘的 ▾。
+
+        QSS 里 down-arrow 被置空（系统画的那个三角在暗色底上几乎看不见），
+        所以统一盖一个透明 label，颜色跟着主题走。
+        """
+        arrow = QLabel("▾", combo)
+        arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        arrow.setAlignment(Qt.AlignCenter)
+        arrow.setGeometry(combo.width() - 18, 0, 16, combo.height())
+        return arrow
+
     def _build_send_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(5)
 
         self.send_input = QLineEdit()
-        self.send_input.setPlaceholderText("在这发弹幕，Enter 发送（最多 20 字）")
+        self.send_input.setPlaceholderText(f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）")
         self.send_input.setMaxLength(SEND_MAX_LEN)
         self.send_input.returnPressed.connect(self._on_send)
         row.addWidget(self.send_input, 1)
@@ -1013,11 +1034,7 @@ class FloatingWindow(QWidget):
         self.mode_box.setCurrentIndex(index if index >= 0 else 0)
         self.mode_box.currentIndexChanged.connect(self._on_send_mode_changed)
         row.addWidget(self.mode_box)
-        # QSS 里把默认箭头去掉了（暗色主题下是黑图），自己贴一个跟着主题变色
-        self.mode_arrow = QLabel("▾", self.mode_box)
-        self.mode_arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.mode_arrow.setAlignment(Qt.AlignCenter)
-        self.mode_arrow.setGeometry(44, 0, 16, 26)
+        self.mode_arrow = self._combo_arrow(self.mode_box)
 
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
@@ -1183,6 +1200,11 @@ class FloatingWindow(QWidget):
         future, self._medal_future = self._medal_future, None
         try:
             self._medals = future.result()
+            # 记住服务端当前戴着哪枚：默认选中它时就不用再 wear 一次
+            for medal in self._medals:
+                if medal.get("wearing"):
+                    self.sender.worn_medal = int(medal["medal_id"])
+                    break
         except SendError as exc:
             self._medals = []
             self._append_sys(f"粉丝牌列表拉取失败：{exc}")
@@ -1208,24 +1230,30 @@ class FloatingWindow(QWidget):
             self.medal_box.setEnabled(False)
             self.medal_box.setToolTip("该账号没有粉丝牌，发的弹幕不会带牌子")
         else:
-            self.medal_box.addItem("不切换牌子", 0)
             room = self.state.real_room
+            worn = 0
             for medal in self._medals:
-                here = room and medal["room_id"] == room
-                self.medal_box.addItem(
-                    f"{medal['name']} Lv{medal['level']}" + ("（本房间）" if here else ""),
-                    medal["medal_id"],
-                )
+                label = f"{medal['name']} Lv{medal['level']}"
+                if medal.get("wearing"):
+                    worn = medal["medal_id"]
+                # 两个标记都挂上会撑出下拉框，本房间的优先显示
+                if room and medal["room_id"] == room:
+                    label += "（本房间）"
+                elif medal.get("wearing"):
+                    label += "（佩戴中）"
+                self.medal_box.addItem(label, medal["medal_id"])
                 self.medal_box.setItemData(
                     self.medal_box.count() - 1,
                     f"{medal['anchor']} · 房间 {medal['room_id']}",
                     Qt.ToolTipRole,
                 )
-            index = self.medal_box.findData(keep)
+            # 默认落在账号当前戴着的那枚（没记过选择时），不要凭空改成别的
+            index = self.medal_box.findData(keep or worn)
             self.medal_box.setCurrentIndex(index if index >= 0 else 0)
             self.medal_box.setEnabled(True)
             self.medal_box.setToolTip(
-                f"账号共 {len(self._medals)} 枚粉丝牌；选了会在发送前先佩戴它。\n"
+                f"账号共 {len(self._medals)} 枚粉丝牌，默认是你现在戴着的那枚；"
+                "选了别的会在发送前先切换。\n"
                 "注意：佩戴是全局状态，网页端也会跟着变；而在这个房间发弹幕时，"
                 "B 站固定显示你在这个主播的牌子，切换改不了它"
             )
@@ -1507,7 +1535,7 @@ class FloatingWindow(QWidget):
         if not self.sender.has_login:
             return "账号目录里没有可用账号：设置里指定目录，放入导出的 cookie 文件"
         who = f"以 {self.sender.uname} 的身份发送" if self.sender.uname else "用当前账号发送"
-        return f"{who}；B 站限制 {SEND_MAX_LEN} 字、约 5 秒一条"
+        return f"{who}；B 站限制 {SEND_MAX_LEN} 字、约 1 秒一条"
 
     def _reload_sender(self) -> None:
         """设置里改过账号目录后重扫一遍，不必重启。"""
@@ -2710,11 +2738,15 @@ class FloatingWindow(QWidget):
     # ----- settings / export -----
 
     def _open_settings(self) -> None:
-        dialog = Dialog(self)
-        dialog.adjustSize()
-        center = self.frameGeometry().center()
-        dialog.move(center - dialog.rect().center())
-        dialog.exec()
+        # 再点一次就收起（popup 按钮的常见手感），不必先点别处
+        if self._settings is not None:
+            if self._settings.isVisible():
+                self._settings.hide()
+                return
+            self._settings.deleteLater()
+        self._settings = SettingsPopup(self)
+        self._settings.adjustSize()
+        self._settings.popup_at(self.settings_btn)
 
     def _export_menu(self) -> None:
         path, selected = QFileDialog.getSaveFileName(
@@ -2738,8 +2770,14 @@ class FloatingWindow(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        height = self.room_input.height()
-        self.room_arrow.setGeometry(self.room_input.width() - 18, 0, 16, height)
+        # 布局跑完才知道控件实际尺寸，箭头在这里对一次位置
+        for combo, arrow in (
+            (self.room_input, self.room_arrow),
+            (self.account_box, self.account_arrow),
+            (self.medal_box, self.medal_arrow),
+            (self.mode_box, self.mode_arrow),
+        ):
+            arrow.setGeometry(combo.width() - 18, 0, 16, combo.height())
 
     def closeEvent(self, event) -> None:
         if self.service.running:
@@ -2768,23 +2806,47 @@ class FloatingWindow(QWidget):
             app.quit()
 
 
-class Dialog(QDialog):
+class SettingsPopup(QDialog):
+    """设置面板按 popup 弹：无标题栏，点外面或按 Esc 就收起。
+
+    主窗口是 frameless + always-on-top 的 Qt.Tool，普通 QDialog 会被压在下面
+    或者抢走焦点不还；用 Popup 和表情面板一个手感，也不会在任务栏留一个独立窗口。
+    """
+
     def __init__(self, owner: FloatingWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        # The main window is a frameless always-on-top Qt.Tool, so the dialog needs its own
-        # top-most flag, otherwise it is rendered underneath the floating panel.
-        self.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint)
+        self._popup_geo = None  # 文件对话框收起时的临时隐藏位置
+        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setWindowTitle("设置")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(470)
         c = owner._c
+        # 下拉箭头：QSS 默认画的是深色小三角，暗色底上完全看不见
+        arrow_png = "arrow-light.png" if owner.theme == "light" else "arrow-dark.png"
+        arrow_url = os.path.join(ASSETS_DIR, arrow_png).replace("\\", "/")
         self.setStyleSheet(f"""
-            QDialog {{ background: {c['dialog_bg']}; }}
+            QFrame#sheet {{
+                background: {c['dialog_bg']};
+                border: 1px solid {c['dialog_border']};
+                border-radius: 10px;
+            }}
             QLabel {{ color: {c['dialog_fg']}; font-size: 12px; }}
+            QLabel#title {{ font-size: 13px; font-weight: 600; }}
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
                 background: {c['dialog_input_bg']}; color: {c['dialog_input_fg']};
                 border: 1px solid {c['dialog_border']};
                 border-radius: 6px; padding: 4px 6px; font-size: 12px;
+            }}
+            QComboBox {{ padding-right: 20px; }}
+            QComboBox::drop-down {{ border: none; width: 18px; }}
+            QComboBox::down-arrow {{
+                image: url({arrow_url}); width: 8px; height: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {c['dialog_input_bg']}; color: {c['dialog_input_fg']};
+                border: 1px solid {c['dialog_border']};
+                selection-background-color: #2f6fed; selection-color: #ffffff;
             }}
             QCheckBox {{ color: {c['dialog_fg']}; }}
             QPushButton {{
@@ -2795,12 +2857,38 @@ class Dialog(QDialog):
                 background: {c['dialog_plain_bg']}; color: {c['dialog_plain_fg']};
                 border: 1px solid {c['dialog_plain_border']};
             }}
+            QPushButton#close {{
+                background: transparent; color: {c['dialog_fg']};
+                border: none; padding: 2px 8px; font-size: 13px;
+            }}
+            QPushButton#close:hover {{ background: {c['dialog_plain_bg']}; border-radius: 6px; }}
         """)
         cfg = owner.cfg
 
-        form = QFormLayout(self)
-        form.setContentsMargins(16, 16, 16, 12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.sheet = QFrame()
+        self.sheet.setObjectName("sheet")
+        outer.addWidget(self.sheet)
+        form = QFormLayout(self.sheet)
+        form.setContentsMargins(16, 12, 16, 12)
         form.setSpacing(10)
+
+        header = QWidget()
+        head_row = QHBoxLayout(header)
+        head_row.setContentsMargins(0, 0, 0, 2)
+        head_row.setSpacing(6)
+        title = QLabel("设置")
+        title.setObjectName("title")
+        head_row.addWidget(title)
+        head_row.addStretch(1)
+        close = QPushButton("✕")
+        close.setObjectName("close")
+        close.setFixedSize(26, 22)
+        close.setToolTip("关闭（Esc）")
+        close.clicked.connect(self.reject)
+        head_row.addWidget(close)
+        form.addRow(header)
 
         self.db = QLineEdit(cfg["database"])
         form.addRow("数据库路径", self._with_browse(self.db, save=True))
@@ -2861,6 +2949,46 @@ class Dialog(QDialog):
         self.raise_()
         self.activateWindow()
 
+    def popup_at(self, anchor: QWidget) -> None:
+        """贴在按钮下方弹出；下面放不下就翻到上面，横向右对齐。"""
+        corner = anchor.mapToGlobal(QPoint(0, 0))
+        screen = anchor.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = corner.x() + anchor.width() - self.width()
+        y = corner.y() + anchor.height() + 6
+        if y + self.height() > area.bottom() - 4:
+            y = max(area.top() + 4, corner.y() - self.height() - 6)
+        x = max(area.left() + 4, min(x, area.right() - self.width() - 4))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    # ----- 文件对话框 -----
+
+    def _suspend_popup(self) -> None:
+        """开文件对话框时先收起自己。
+
+        Popup 有自己的鼠标/键盘 grab，系统文件对话框一抢焦点它就会自己收起，
+        而且那之后 Qt 不允许再把它弹回来。所以先主动 hide，选完再放回去。
+        """
+        self._popup_geo = self.geometry()
+        self.hide()
+
+    def _resume_popup(self) -> None:
+        if self._popup_geo is not None:
+            self.setGeometry(self._popup_geo)
+        self.show()
+        # Popup 重新出现时第一次 show() 会被 Qt 的 popup 管理吞掉（立刻隐藏），
+        # setVisible(True) 才是真正把面板放回去的那一下
+        self.setVisible(True)
+        self.raise_()
+        QTimer.singleShot(0, self._reshow_popup)
+
+    def _reshow_popup(self) -> None:
+        self.setVisible(True)
+        self.raise_()
+
     def _with_browse(self, entry: QLineEdit, save: bool) -> QWidget:
         holder = QWidget()
         row = QHBoxLayout(holder)
@@ -2871,10 +2999,18 @@ class Dialog(QDialog):
         button.setObjectName("plain")
 
         def browse() -> None:
-            if save:
-                path, _ = QFileDialog.getSaveFileName(self, "选择数据库", entry.text(), "SQLite (*.db)")
-            else:
-                path, _ = QFileDialog.getSaveFileName(self, "选择日志", entry.text(), "Log (*.log)")
+            self._suspend_popup()
+            try:
+                if save:
+                    path, _ = QFileDialog.getSaveFileName(
+                        self, "选择数据库", entry.text(), "SQLite (*.db)"
+                    )
+                else:
+                    path, _ = QFileDialog.getSaveFileName(
+                        self, "选择日志", entry.text(), "Log (*.log)"
+                    )
+            finally:
+                self._resume_popup()
             if path:
                 entry.setText(path)
 
@@ -2893,9 +3029,13 @@ class Dialog(QDialog):
         button.setObjectName("plain")
 
         def browse() -> None:
-            path = QFileDialog.getExistingDirectory(
-                self, "选择账号目录", entry.text() or os.path.dirname(self.owner.config_path)
-            )
+            self._suspend_popup()
+            try:
+                path = QFileDialog.getExistingDirectory(
+                    self, "选择账号目录", entry.text() or os.path.dirname(self.owner.config_path)
+                )
+            finally:
+                self._resume_popup()
             if path:
                 entry.setText(path)
 
@@ -2932,8 +3072,24 @@ class Dialog(QDialog):
         self.accept()
 
 
+def _set_app_user_model_id() -> None:
+    """让任务栏/Alt-Tab 认这个应用自己的图标，而不是 python.exe 的。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("danmaku-it")
+    except Exception:  # noqa: BLE001 - 改造失败不影响运行
+        pass
+
+
 def run_gui(config_path: str) -> int:
+    _set_app_user_model_id()
     app = QApplication.instance() or QApplication([])
+    icon = QIcon(ICON_PATH) if os.path.exists(ICON_PATH) else QIcon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     # The main window is a Qt.Tool, which does not count as a "primary window".
     # Without this, closing any child dialog (e.g. settings) quits the whole app.
     app.setQuitOnLastWindowClosed(False)
