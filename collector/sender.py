@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -31,6 +33,11 @@ EMOTICON_URL = (
     "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
     "?platform=pc&room_id={room}"
 )
+# 匿名领一对 buvid3/buvid4（设备指纹）。**没有它会掉表情包**：实测同一个账号
+# 缺 buvid3 时 GetEmoticons 只回「通用表情 + 房间专属」，补上之后才多出
+# emoji(pkg_type=3) 和账号自己的装扮表情(pkg_type=5)。cookie 文件是浏览器导出
+# 的，不一定带 buvid（HttpOnly 的那个常被扩展漏掉），所以这里自己领一份补进去。
+BUVID_URL = "https://api.bilibili.com/x/frontend/finger/spi"
 # 当前账号在这个房间**真正**能用的颜色和位置。房间可以限制彩色/顶部弹幕，
 # 此时发弹幕接口不报错，只是悄悄按白色滚动下发，所以必须先问这个接口
 DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigByGroup?room_id={room}"
@@ -94,6 +101,24 @@ class SendError(Exception):
         self.code = code
 
 
+# 装扮表情的 unique 形如 upower_[<装扮名>_<表情名>]，靠它把一堆同名的
+# 「装扮表情」拆成能认出来的分组名；upower_[笑哭] 这种没有装扮名的就退回默认
+_UPOWER_RE = re.compile(r"^upower_\[(.+?)_[^\]]*\]$")
+
+
+def _package_label(pkg: dict, pkg_type: int) -> str:
+    """给表情包起个能在分组条上认出来的名字。"""
+    name = str(pkg.get("pkg_name") or "表情").strip() or "表情"
+    if pkg_type != 5:
+        return name
+    # 装扮表情的 pkg_name 全都叫「装扮表情」，用第一枚表情的 unique 反推装扮名
+    for raw in pkg.get("emoticons") or []:
+        match = _UPOWER_RE.match(str(raw.get("emoticon_unique") or "").strip())
+        if match:
+            return match.group(1)
+    return name
+
+
 def load_cookies(path: str) -> dict[str, str]:
     """读 cookie 文件，返回 ``{name: value}``；文件不存在返回空 dict。
 
@@ -142,6 +167,7 @@ class DanmakuSender:
         self._ua = config.get("user_agent") or DEFAULT_UA
         self._cookies: dict[str, str] = {}
         self._jct = ""
+        self._buvid_tried = False
         self._lock = threading.Lock()
         self._last_sent = 0.0
         self.uname = ""
@@ -171,6 +197,18 @@ class DanmakuSender:
     @property
     def has_login(self) -> bool:
         return bool(self._cookies.get("SESSDATA"))
+
+    @property
+    def cache_key(self) -> str:
+        """按账号分缓存用的指纹：SESSDATA 摘要，不落明文。
+
+        表情包是"账号能用的那一份"，不同账号差别很大（大号有整套装扮表情），
+        只按房间缓存会把小号的列表喂给大号。
+        """
+        sess = self._cookies.get("SESSDATA") or ""
+        if not sess:
+            return "anon"
+        return hashlib.sha1(sess.encode("utf-8")).hexdigest()[:10]
 
     @property
     def cookie_source(self) -> str:
@@ -217,12 +255,36 @@ class DanmakuSender:
 
     # ----- 请求 -----
 
+    def _ensure_buvid(self) -> None:
+        """缺 buvid3 就领一对补上；只试一次，失败也不重试。
+
+        见 ``BUVID_URL`` 的注释：没有它，GetEmoticons 会少给 emoji 和账号
+        自己的装扮表情。顺带发弹幕时也带上，行为更接近真实浏览器。
+        """
+        if self._buvid_tried:
+            return
+        self._buvid_tried = True
+        if self._cookies.get("buvid3"):
+            return
+        try:
+            payload = self._get_json(BUVID_URL, "https://www.bilibili.com/")
+        except Exception:  # noqa: BLE001 - 领不到不影响收弹幕
+            return
+        data = payload.get("data") or {}
+        for key, name in (("buvid3", "b_3"), ("buvid4", "b_4")):
+            value = str(data.get(name) or "").strip()
+            if value:
+                self._cookies[key] = value
+
     def _get_json(self, url: str, referer: str) -> dict:
+        # _ensure_buvid 用同一个方法取 spi，靠 _buvid_tried 提前置位来终止递归
+        self._ensure_buvid()
         req = urllib.request.Request(url, headers=self._headers(referer))
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
     def _post_json(self, url: str, body: bytes, referer: str) -> dict:
+        self._ensure_buvid()
         headers = dict(self._headers(referer))
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -325,14 +387,16 @@ class DanmakuSender:
     # ----- 表情 -----
 
     def fetch_emoticons(self, room_id: int) -> list[dict]:
-        """拉这个房间能用的表情包，含账号自己解锁的（粉丝牌 / 房间专属）。
+        """拉这个房间能用的表情包，含账号自己解锁的（装扮 / 房间专属 / emoji）。
 
-        返回 ``[{"name", "type", "items": [{"text", "url", "unique"}]}]``。
-        ``text`` 就是要发出去的弹幕内容，直接当 ``msg`` 用：
-        官方表情是 ``冲鸭`` 这种裸文本，emoji 包自带方括号（``[dog]``），
-        粉丝牌表情是 ``[腾讯招聘_鹅的大口]``，都不要自己再包一层。
+        返回 ``[{"name", "type", "items": [{"text", "url", "unique", "msg", "dm_type"}]}]``。
+        ``text`` 是显示用的名字，``msg`` 才是发出去的内容：图片表情填唯一 ID，
+        文本表情填 ``[dog]`` 这种带方括号的文字（前端自己渲染成图）。
 
-        ``perm <= 0`` 表示没解锁，发出去服务端会拦住，直接过滤掉。
+        接口按 ``perm`` 标「有没有解锁」，``perm <= 0`` 的发出去服务端会拦，直接过滤。
+
+        **必须带 buvid3**，否则接口只回通用 + 房间表情，账号自己的装扮表情
+        （``pkg_type=5``）和 emoji 包（``pkg_type=3``）整套都不给，见 ``BUVID_URL``。
         """
         url = EMOTICON_URL.format(room=int(room_id or 0))
         try:
@@ -349,10 +413,10 @@ class DanmakuSender:
         packages: list[dict] = []
         for pkg in (payload.get("data") or {}).get("data") or []:
             pkg_type = int(pkg.get("pkg_type") or 0)
-            # 官方表情(pkg_type=1)和房间专属(pkg_type=2)是"图片表情"，必须走
-            # dm_type=1 且 msg 填唯一 ID；emoji 包(pkg_type=3)是文本表情，
-            # 发形如 [dog] 的文字，前端自己会渲染成图。
-            as_image = pkg_type in (1, 2)
+            # 官方表情(1)、房间专属/UP主(2)、装扮表情(5) 都是"图片表情"，必须走
+            # dm_type=1 且 msg 填唯一 ID；emoji 包(3) 是文本表情，发 [dog] 这种
+            # 文字，前端自己会渲染成图。
+            as_image = pkg_type in (1, 2, 5)
             items: list[dict] = []
             for raw in pkg.get("emoticons") or []:
                 if not raw.get("perm", 1):
@@ -378,14 +442,23 @@ class DanmakuSender:
             if items:
                 packages.append(
                     {
-                        "name": str(pkg.get("pkg_name") or "表情"),
+                        "name": _package_label(pkg, pkg_type),
                         "type": pkg_type,
                         "items": items,
                     }
                 )
 
-        # 房间专属排前面：最常用的就是它们
-        packages.sort(key=lambda pkg: 0 if pkg["type"] == 2 else pkg["type"])
+        # 顺序：房间专属 / UP主 → 通用 → 装扮 → emoji。
+        # 房间专属最常用，emoji 是文字表情，放最后省的误点。
+        order = {2: 0, 1: 1, 5: 2, 3: 3}
+        packages.sort(key=lambda pkg: order.get(pkg["type"], 9))
+        # 同名分组加序号（几套装扮撞名、两个 emoji 包之类），分组条上才分得清
+        seen: dict[str, int] = {}
+        for pkg in packages:
+            name = pkg["name"]
+            seen[name] = seen.get(name, 0) + 1
+            if seen[name] > 1:
+                pkg["name"] = f"{name} {seen[name]}"
         return packages
 
     # ----- 粉丝牌 -----

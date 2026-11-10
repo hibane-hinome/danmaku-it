@@ -516,11 +516,22 @@ class EmoticonPanel(QWidget):
         root.setContentsMargins(8, 7, 8, 7)
         root.setSpacing(5)
 
-        self._chip_row = QHBoxLayout()
+        # 分组条装得下的账号只有两三个包，大号能拉出十来个（房间 + 通用 + 各套装扮
+        # + emoji），一行放不下，所以套一层横向滚动，滚轮在条上也能横着滚
+        self._chip_scroll = QScrollArea()
+        self._chip_scroll.setWidgetResizable(True)
+        self._chip_scroll.setFrameShape(QFrame.NoFrame)
+        self._chip_scroll.setFixedHeight(26)
+        self._chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._chip_host = QWidget()
+        self._chip_host.setObjectName("emoteChipHost")
+        self._chip_row = QHBoxLayout(self._chip_host)
         self._chip_row.setContentsMargins(0, 0, 0, 0)
         self._chip_row.setSpacing(4)
         self._chip_row.addStretch(1)
-        root.addLayout(self._chip_row)
+        self._chip_scroll.setWidget(self._chip_host)
+        root.addWidget(self._chip_scroll)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -553,7 +564,7 @@ class EmoticonPanel(QWidget):
             EmoticonPanel {{ background: {colors['dialog_bg']};
                              border: 1px solid {colors['dialog_border']}; border-radius: 10px; }}
             QLabel {{ color: {colors['dialog_fg']}; font-size: 11px; background: transparent; }}
-            QScrollArea, QWidget#emoteBody {{ background: transparent; border: none; }}
+            QScrollArea, QWidget#emoteBody, QWidget#emoteChipHost {{ background: transparent; border: none; }}
             QPushButton#emoteChip {{
                 background: transparent; border: none; color: {colors['time']};
                 padding: 2px 7px; font-size: 11px; border-radius: 5px;
@@ -637,6 +648,7 @@ class EmoticonPanel(QWidget):
             chip.setObjectName("emoteChip")
             chip.setProperty("on", "false")
             chip.setCursor(Qt.PointingHandCursor)
+            chip.setToolTip(f"{pkg['name']} · {len(pkg['items'])} 个")
             chip.clicked.connect(lambda _=False, i=index: self._select(i))
             # 插在 stretch 之前，让分组靠左
             self._chip_row.insertWidget(len(self._chips), chip)
@@ -650,7 +662,19 @@ class EmoticonPanel(QWidget):
             chip.setProperty("on", "true" if i == self._active else "false")
             chip.style().unpolish(chip)
             chip.style().polish(chip)
+        if 0 <= self._active < len(self._chips):
+            # 组多的时候选中的按钮可能在可视区外
+            self._chip_scroll.ensureWidgetVisible(self._chips[self._active], 4, 0)
         self._fill(self._packages[self._active])
+
+    def wheelEvent(self, event) -> None:
+        # 指针在分组条上时滚轮横着滚分组，在下面网格里就正常滚表情
+        if self._chip_scroll.geometry().contains(event.position().toPoint()):
+            bar = self._chip_scroll.horizontalScrollBar()
+            bar.setValue(bar.value() - event.angleDelta().y())
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def _fill(self, pkg: dict) -> None:
         self._clear_buttons()
@@ -1378,7 +1402,8 @@ class FloatingWindow(QWidget):
 
     def _emoticon_cache_path(self, room: int) -> str:
         base = os.path.join(os.path.dirname(self.config_path), "cache")
-        return os.path.join(base, f"emoticons_{int(room)}.json")
+        # 带上账号指纹：大号和小号能用的表情包不是一个集合
+        return os.path.join(base, f"emoticons_{int(room)}_{self.sender.cache_key}.json")
 
     def _emoticon_room(self) -> int:
         room = self._send_room()
@@ -1471,6 +1496,10 @@ class FloatingWindow(QWidget):
         dm_type = int(item.get("dm_type") or 0)
         current = self.send_input.text().strip()
         if current:
+            if dm_type:
+                # 图片表情的 msg 是唯一 ID，混在文字里发出去只会变成 ID 或被拒
+                self._append_sys("图片表情只能单独发：先把输入框里的字发掉或清空")
+                return
             # 已经在写别的：插到光标处，让人接着写完再一起发
             if len(current) + len(text) > SEND_MAX_LEN:
                 self._append_sys(
