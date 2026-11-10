@@ -805,6 +805,9 @@ class FloatingWindow(QWidget):
         # 当前账号的粉丝牌（账号级，不随房间变）
         self._medals: list[dict] = []
         self._medal_future: Future | None = None
+        # 换牌子是账号级操作，单独一路，别和拉列表抢同一个 worker
+        self._wear_future: Future | None = None
+        self._wear_target = 0
         # 发弹幕：只读 cookie 不联网，首次发送时再在后台线程 verify
         preferred = self._preferred_account()
         self.sender = DanmakuSender(self.cfg, preferred)
@@ -1052,7 +1055,9 @@ class FloatingWindow(QWidget):
 
         self.medal_box = QComboBox()
         self.medal_box.setFixedWidth(186)
-        self.medal_box.setToolTip("默认是账号当前戴着的牌子；换一个会在发送前切过去")
+        self.medal_box.setToolTip(
+            "默认是账号当前戴着的牌子；换一个会立刻改掉账号上的佩戴（弹幕上显示的就是它）"
+        )
         self.medal_box.currentIndexChanged.connect(self._on_medal_changed)
         row.addWidget(self.medal_box)
         self.medal_arrow = self._combo_arrow(self.medal_box)
@@ -1345,6 +1350,58 @@ class FloatingWindow(QWidget):
             return
         self.cfg["send_medal"] = medal_id
         self._save_config_quiet()
+        # 选了就立刻戴：弹幕显示哪枚牌子完全由佩戴状态决定，早点换过来，
+        # 免得要等到发下一条才生效（发完再换回来这种"临时佩戴"B站不支持）。
+        if medal_id and self.medal_box.isEnabled():
+            self._wear_medal_now(medal_id)
+
+    def _medal_label(self, medal_id: int) -> str:
+        for medal in self._medals:
+            if int(medal["medal_id"]) == int(medal_id):
+                return f"{medal['name']} Lv{medal['level']}"
+        return f"粉丝牌 {medal_id}"
+
+    def _wear_medal_now(self, medal_id: int) -> None:
+        """把账号全局佩戴换成这枚牌子（后台线程，不卡界面）。"""
+        if self._wear_future is not None or not self.sender.has_login:
+            return
+        if not self._room_ready():
+            return
+        if self.sender.worn_medal == medal_id:
+            return
+        self._wear_target = int(medal_id)
+        sender = self.sender
+        self._wear_future = self._account_pool.submit(self._wear_worker, sender, int(medal_id))
+
+    def _wear_worker(self, sender: DanmakuSender, medal_id: int) -> tuple[bool, str]:
+        try:
+            sender.wear_medal(medal_id)
+            return True, ""
+        except SendError as exc:
+            return False, str(exc)
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _poll_wear(self) -> None:
+        if self._wear_future is None or not self._wear_future.done():
+            return
+        future, self._wear_future = self._wear_future, None
+        try:
+            ok, payload = future.result()
+        except Exception as exc:  # noqa: BLE001
+            ok, payload = False, f"{type(exc).__name__}: {exc}"
+        target = self._wear_target
+        if ok:
+            # 「（佩戴中）」「（本房间）」这些标注得跟着换一枚，不然读起来自相矛盾
+            for medal in self._medals:
+                medal["wearing"] = int(medal["medal_id"]) == target
+            self._fill_medal_box()
+            self._append_sys(
+                f"已换成 {self._medal_label(target)}，账号上佩戴的粉丝牌跟着改了"
+            )
+        else:
+            # 没戴上不改下拉：这条还会在下次发送时再试一次
+            self._append_sys(f"切换粉丝牌失败：{payload}（发送时会再试一次）")
 
     def _selected_medal(self) -> int:
         if not self.medal_box.isEnabled():
@@ -2588,6 +2645,7 @@ class FloatingWindow(QWidget):
         self._poll_room_context()
         self._poll_account_meta()
         self._poll_medals()
+        self._poll_wear()
         self._refresh_avatars()
 
         batch: list[dict] = []
