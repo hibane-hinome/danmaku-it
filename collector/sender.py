@@ -24,11 +24,39 @@ import urllib.request
 SEND_URL = "https://api.live.bilibili.com/msg/send"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 CSRF_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/info?csrf="
+EMOTICON_URL = (
+    "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
+    "?platform=pc&room_id={room}"
+)
+# 当前账号在这个房间**真正**能用的颜色和位置。房间可以限制彩色/顶部弹幕，
+# 此时发弹幕接口不报错，只是悄悄按白色滚动下发，所以必须先问这个接口
+DM_CONFIG_URL = "https://api.live.bilibili.com/xlive/web-room/v1/dM/GetDMConfigByGroup?room_id={room}"
 
 # 单条弹幕上限（B 站按字符计）
 MAX_LEN = 20
 # 同一账号两次发送的最小间隔，服务端约 5 秒，本地先挡一层避免无谓报错
 MIN_INTERVAL = 5.0
+
+# 弹幕位置，对应发弹幕接口的 mode 字段
+MODE_SCROLL = 1
+MODE_BOTTOM = 4
+MODE_TOP = 5
+MODES = ((MODE_SCROLL, "滚动"), (MODE_BOTTOM, "底部"), (MODE_TOP, "顶部"))
+# 默认白色，十进制 RGB
+DEFAULT_COLOR = 16777215
+# 常用色板，值是十进制（B 站接口就收这个）
+COLOR_PRESETS = (
+    ("白", 16777215),
+    ("红", 16711680),
+    ("橙", 16750592),
+    ("黄", 16776960),
+    ("绿", 65280),
+    ("青", 65535),
+    ("蓝", 255),
+    ("紫", 8388863),
+    ("粉", 16741248),
+    ("灰", 11184810),
+)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -211,7 +239,21 @@ class DanmakuSender:
         with self._lock:
             return max(0.0, MIN_INTERVAL - (time.monotonic() - self._last_sent))
 
-    def send(self, room_id: int, text: str) -> dict:
+    def send(
+        self,
+        room_id: int,
+        text: str,
+        *,
+        color: int = DEFAULT_COLOR,
+        mode: int = MODE_SCROLL,
+        dm_type: int = 0,
+    ) -> dict:
+        """发一条弹幕。
+
+        ``dm_type=0`` 是普通文本（``text`` 就是看到的字）；
+        ``dm_type=1`` 是表情，此时 ``text`` 必须是表情的唯一 ID
+        （``room_42062_121079`` 这种），发文字名会回 10203 表情发送失败。
+        """
         text = (text or "").strip()
         if not text:
             raise SendError("不能发空弹幕")
@@ -228,19 +270,22 @@ class DanmakuSender:
         if wait > 0:
             raise SendError(f"发太快了，{wait:.0f} 秒后再发")
 
-        body = urllib.parse.urlencode(
-            {
-                "color": "16777215",
-                "fontsize": "25",
-                "mode": "1",
-                "msg": text,
-                "rnd": str(int(time.time() * 1000)),
-                "roomid": str(int(room_id)),
-                "bubble": "0",
-                "csrf": self._jct,
-                "csrf_token": self._jct,
-            }
-        ).encode("utf-8")
+        mode = mode if mode in (MODE_SCROLL, MODE_BOTTOM, MODE_TOP) else MODE_SCROLL
+        fields = {
+            "color": str(max(0, min(int(color), 16777215))),
+            "fontsize": "25",
+            "mode": str(mode),
+            "msg": text,
+            "rnd": str(int(time.time() * 1000)),
+            "roomid": str(int(room_id)),
+            "bubble": "0",
+            "csrf": self._jct,
+            "csrf_token": self._jct,
+        }
+        if dm_type:
+            fields["dm_type"] = str(int(dm_type))
+            fields["room_type"] = "0"
+        body = urllib.parse.urlencode(fields).encode("utf-8")
 
         try:
             payload = self._post_json(
@@ -258,3 +303,130 @@ class DanmakuSender:
         message = payload.get("message") or payload.get("msg") or ""
         hint = _CODE_HINTS.get(code)
         raise SendError(hint or message or f"发送失败（code={code}）", code)
+
+    # ----- 表情 -----
+
+    def fetch_emoticons(self, room_id: int) -> list[dict]:
+        """拉这个房间能用的表情包，含账号自己解锁的（粉丝牌 / 房间专属）。
+
+        返回 ``[{"name", "type", "items": [{"text", "url", "unique"}]}]``。
+        ``text`` 就是要发出去的弹幕内容，直接当 ``msg`` 用：
+        官方表情是 ``冲鸭`` 这种裸文本，emoji 包自带方括号（``[dog]``），
+        粉丝牌表情是 ``[腾讯招聘_鹅的大口]``，都不要自己再包一层。
+
+        ``perm <= 0`` 表示没解锁，发出去服务端会拦住，直接过滤掉。
+        """
+        url = EMOTICON_URL.format(room=int(room_id or 0))
+        try:
+            payload = self._get_json(url, f"https://live.bilibili.com/{int(room_id or 0)}")
+        except Exception as exc:  # noqa: BLE001 - 界面只关心成不成
+            raise SendError(f"拉表情失败：{exc}") from exc
+
+        if payload.get("code") not in (0, None):
+            raise SendError(
+                payload.get("message") or f"拉表情失败（code={payload.get('code')}）",
+                payload.get("code"),
+            )
+
+        packages: list[dict] = []
+        for pkg in (payload.get("data") or {}).get("data") or []:
+            pkg_type = int(pkg.get("pkg_type") or 0)
+            # 官方表情(pkg_type=1)和房间专属(pkg_type=2)是"图片表情"，必须走
+            # dm_type=1 且 msg 填唯一 ID；emoji 包(pkg_type=3)是文本表情，
+            # 发形如 [dog] 的文字，前端自己会渲染成图。
+            as_image = pkg_type in (1, 2)
+            items: list[dict] = []
+            for raw in pkg.get("emoticons") or []:
+                if not raw.get("perm", 1):
+                    continue
+                text = str(raw.get("emoji") or "").strip()
+                src = str(raw.get("url") or "").strip()
+                unique = str(raw.get("emoticon_unique") or "").strip()
+                if not text or not src:
+                    continue
+                # hdslb 走 http 也能下，但 https 免掉一次 302
+                if src.startswith("http://"):
+                    src = "https://" + src[len("http://"):]
+                image_send = as_image and bool(unique)
+                items.append(
+                    {
+                        "text": text,
+                        "url": src,
+                        "unique": unique,
+                        "msg": unique if image_send else text,
+                        "dm_type": 1 if image_send else 0,
+                    }
+                )
+            if items:
+                packages.append(
+                    {
+                        "name": str(pkg.get("pkg_name") or "表情"),
+                        "type": pkg_type,
+                        "items": items,
+                    }
+                )
+
+        # 房间专属排前面：最常用的就是它们
+        packages.sort(key=lambda pkg: 0 if pkg["type"] == 2 else pkg["type"])
+        return packages
+
+    # ----- 颜色 / 位置可用性 -----
+
+    def fetch_send_config(self, room_id: int) -> dict:
+        """问服务端：这个账号在这个房间能用哪些颜色和位置。
+
+        返回 ``{"colors": [...], "modes": [...]}``，每项带 ``status``：
+        1 可用，0 不可用。**不可用的选了也白发**——发弹幕接口照样回 code=0，
+        但服务端会把颜色改回白色、位置改回滚动。所以界面只该把可用的给人选。
+        """
+        url = DM_CONFIG_URL.format(room=int(room_id or 0))
+        try:
+            payload = self._get_json(url, f"https://live.bilibili.com/{int(room_id or 0)}")
+        except Exception as exc:  # noqa: BLE001 - 拿不到就退回默认色板
+            raise SendError(f"拉弹幕配置失败：{exc}") from exc
+        if payload.get("code") not in (0, None):
+            raise SendError(
+                payload.get("message") or f"拉弹幕配置失败（code={payload.get('code')}）",
+                payload.get("code"),
+            )
+
+        data = payload.get("data") or {}
+        colors: list[dict] = []
+        seen: set[int] = set()
+        for group in data.get("group") or []:
+            for raw in group.get("color") or []:
+                try:
+                    value = int(raw.get("color"))
+                except (TypeError, ValueError):
+                    continue
+                if value in seen:
+                    continue
+                seen.add(value)
+                colors.append(
+                    {
+                        "name": str(raw.get("name") or ""),
+                        "color": value,
+                        "status": 1 if int(raw.get("status") or 0) else 0,
+                        "group": str(group.get("name") or ""),
+                    }
+                )
+
+        modes: list[dict] = []
+        for raw in data.get("mode") or []:
+            try:
+                value = int(raw.get("mode"))
+            except (TypeError, ValueError):
+                continue
+            modes.append(
+                {
+                    "name": str(raw.get("name") or ""),
+                    "mode": value,
+                    "status": 1 if int(raw.get("status") or 0) else 0,
+                }
+            )
+
+        # 颜色排在可用的前面，界面直接取前几个就是能点的
+        colors.sort(key=lambda item: 0 if item["status"] else 1)
+        return {"colors": colors, "modes": modes}
+
+

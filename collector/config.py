@@ -21,6 +21,9 @@ DEFAULTS = {
     "record_enter": True,
     "record_events": False,
     "theme": "dark",
+    # 发弹幕用：颜色是十进制 RGB（16777215 = 白色），mode 1 滚动 / 4 底部 / 5 顶部
+    "send_color": 16777215,
+    "send_mode": 1,
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

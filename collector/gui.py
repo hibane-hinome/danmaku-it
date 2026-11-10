@@ -13,16 +13,16 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QGuiApplication, QImage, QTextBlockUserData,
-    QTextCharFormat, QTextCursor, QTextDocument,
+    QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPixmap,
+    QTextBlockUserData, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
-    QPlainTextEdit, QPushButton, QSizeGrip, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizeGrip,
+    QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from .bili_api import BiliApi
@@ -30,8 +30,8 @@ from .collector import RoomCollector
 from .config import DEFAULTS
 from .fixtures import JPN_AFTER, JPN_BEFORE, load_replay
 from .images import ImageLoader
-from .sender import MAX_LEN as SEND_MAX_LEN
-from .sender import DanmakuSender, SendError
+from .sender import COLOR_PRESETS, MAX_LEN as SEND_MAX_LEN
+from .sender import DEFAULT_COLOR, MODES, DanmakuSender, SendError
 from .storage import Storage, export_csv, export_ndjson, extract_sc
 
 TITLE = "SC Collector · 外挂弹幕机"
@@ -45,6 +45,11 @@ TICK_MS = 30
 IMAGE_WAIT_SECONDS = 0.4
 MAX_PENDING_DANMAKU = 200
 EMOTE_PX = 20
+# 表情面板：按钮尺寸、每行几个、面板宽高
+EMOTICON_BTN = 40
+EMOTICON_COLS = 8
+EMOTICON_PANEL_W = 344
+EMOTICON_PANEL_H = 268
 
 
 # ---------------- config helpers ----------------
@@ -431,6 +436,208 @@ def resolve_theme(name: str) -> str:
     return name if name in THEME_COLORS else "dark"
 
 
+class EmoticonPanel(QWidget):
+    """点「表情」弹出的选择面板。
+
+    用 ``Qt.Popup`` 独立窗口，点别处自动收起，行为和原生下拉一致。图片交给
+    ``ImageLoader``（和弹幕列表共享磁盘缓存），谁先下完谁先画，没到的先留空位，
+    不会为了等图把面板卡住。
+    """
+
+    picked = Signal(object)
+
+    def __init__(self, loader: ImageLoader, parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.Popup)
+        self._loader = loader
+        self._packages: list[dict] = []
+        self._buttons: list[tuple[QPushButton, str]] = []
+        self._chips: list[QPushButton] = []
+        self._active = 0
+        self._ticks = 0
+        self.setFixedSize(EMOTICON_PANEL_W, EMOTICON_PANEL_H)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 7, 8, 7)
+        root.setSpacing(5)
+
+        self._chip_row = QHBoxLayout()
+        self._chip_row.setContentsMargins(0, 0, 0, 0)
+        self._chip_row.setSpacing(4)
+        self._chip_row.addStretch(1)
+        root.addLayout(self._chip_row)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._body = QWidget()
+        self._grid = QGridLayout(self._body)
+        self._grid.setContentsMargins(2, 2, 2, 2)
+        self._grid.setSpacing(2)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._scroll.setWidget(self._body)
+        root.addWidget(self._scroll, 1)
+
+        self._hint = QLabel("正在拉取表情…")
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setWordWrap(True)
+        root.addWidget(self._hint, 1)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._on_tick)
+
+        self.apply_theme(THEME_COLORS["dark"])
+
+    # ----- 外部 -----
+
+    def apply_theme(self, colors: dict) -> None:
+        self.setStyleSheet(
+            f"""
+            EmoticonPanel {{ background: {colors['dialog_bg']};
+                             border: 1px solid {colors['dialog_border']}; border-radius: 10px; }}
+            QLabel {{ color: {colors['dialog_fg']}; font-size: 11px; background: transparent; }}
+            QScrollArea, QWidget#emoteBody {{ background: transparent; border: none; }}
+            QPushButton#emoteChip {{
+                background: transparent; border: none; color: {colors['time']};
+                padding: 2px 7px; font-size: 11px; border-radius: 5px;
+            }}
+            QPushButton#emoteChip:hover {{ color: {colors['dialog_fg']}; }}
+            QPushButton#emoteChip[on="true"] {{
+                background: rgba(47, 111, 237, 55); color: {colors['text']};
+            }}
+            QPushButton#emoteItem {{
+                background: transparent; border: 1px solid transparent; border-radius: 6px;
+            }}
+            QPushButton#emoteItem:hover {{ background: rgba(47, 111, 237, 60); }}
+            QScrollBar:vertical {{ background: transparent; width: 8px; margin: 1px; }}
+            QScrollBar::handle:vertical {{ background: {colors['grip']}; border-radius: 4px; min-height: 20px; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+            """
+        )
+        self._body.setObjectName("emoteBody")
+
+    def set_packages(self, packages: list[dict], message: str = "") -> None:
+        """喂入表情包；``packages`` 为空时把 ``message`` 当提示显示。"""
+        self._packages = list(packages or [])
+        if not self._packages:
+            self._clear_chips()
+            self._clear_buttons()
+            self._scroll.hide()
+            self._hint.setText(message or "没有可用表情")
+            self._hint.show()
+            return
+        self._hint.hide()
+        self._scroll.show()
+        self._rebuild_chips()
+        self._select(min(self._active, len(self._packages) - 1))
+
+    def popup_at(self, anchor: QWidget) -> None:
+        """贴在按钮上方弹出；上面放不下就翻到下面。"""
+        corner = anchor.mapToGlobal(QPoint(0, 0))
+        screen = anchor.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = corner.x() + anchor.width() - self.width()
+        y = corner.y() - self.height() - 6
+        if y < area.top() + 4:
+            y = corner.y() + anchor.height() + 6
+        x = max(area.left() + 4, min(x, area.right() - self.width() - 4))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self._on_tick()
+
+    # ----- 内部 -----
+
+    def _clear_chips(self) -> None:
+        for chip in self._chips:
+            self._chip_row.removeWidget(chip)
+            chip.hide()
+            chip.setParent(None)
+            chip.deleteLater()
+        self._chips = []
+        self._active = 0
+
+    def _clear_buttons(self) -> None:
+        self._timer.stop()
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                # 只 removeWidget 不够：deleteLater 是延时的，旧按钮会盖在新按钮上
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        self._buttons = []
+
+    def _rebuild_chips(self) -> None:
+        self._clear_chips()
+        for index, pkg in enumerate(self._packages):
+            name = pkg["name"]
+            if len(name) > 7:
+                name = name[:7] + "…"
+            chip = QPushButton(f"{name} {len(pkg['items'])}")
+            chip.setObjectName("emoteChip")
+            chip.setProperty("on", "false")
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.clicked.connect(lambda _=False, i=index: self._select(i))
+            # 插在 stretch 之前，让分组靠左
+            self._chip_row.insertWidget(len(self._chips), chip)
+            self._chips.append(chip)
+
+    def _select(self, index: int) -> None:
+        if not self._packages:
+            return
+        self._active = max(0, min(index, len(self._packages) - 1))
+        for i, chip in enumerate(self._chips):
+            chip.setProperty("on", "true" if i == self._active else "false")
+            chip.style().unpolish(chip)
+            chip.style().polish(chip)
+        self._fill(self._packages[self._active])
+
+    def _fill(self, pkg: dict) -> None:
+        self._clear_buttons()
+        for i, item in enumerate(pkg["items"]):
+            btn = QPushButton()
+            btn.setObjectName("emoteItem")
+            btn.setFixedSize(EMOTICON_BTN, EMOTICON_BTN)
+            btn.setIconSize(QSize(EMOTICON_BTN - 8, EMOTICON_BTN - 8))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(item["text"])
+            btn.clicked.connect(lambda _=False, data=item: self.picked.emit(data))
+            self._grid.addWidget(btn, i // EMOTICON_COLS, i % EMOTICON_COLS)
+            self._buttons.append((btn, item["url"]))
+            self._loader.want(item["url"])
+        self._ticks = 0
+        self._on_tick()
+        self._scroll.verticalScrollBar().setValue(0)
+
+    def _on_tick(self) -> None:
+        pending = False
+        for btn, url in self._buttons:
+            if not btn.icon().isNull():
+                continue
+            image = self._loader.image(url)
+            if image is not None and not image.isNull():
+                btn.setIcon(QIcon(QPixmap.fromImage(image)))
+            elif self._loader.settled(url):
+                # 下不来就留空白，tooltip 里有名字，不反复重试
+                btn.setIcon(QIcon())
+            else:
+                pending = True
+        self._ticks += 1
+        if not pending or self._ticks > 40:
+            self._timer.stop()
+        elif not self._timer.isActive():
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+
 class PaneDragHandle(QObject):
     """Drag handle that moves a whole pane up or down inside the splitter."""
 
@@ -478,6 +685,19 @@ class FloatingWindow(QWidget):
         self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
         self._send_future: Future | None = None
         self._send_offline = False
+        self.send_color = int(self.cfg.get("send_color", DEFAULT_COLOR)) & 0xFFFFFF
+        # 表情面板单独一份图（要更大的尺寸），磁盘缓存和弹幕列表共用
+        self._emote_images = ImageLoader(
+            os.path.join(os.path.dirname(self.config_path), "cache", "images"),
+            max_px=EMOTICON_BTN * 2,
+        )
+        self._emote_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="emote")
+        self._context_future: Future | None = None
+        self._emote_room = 0
+        self._emote_packages: list[dict] = []
+        self._emote_message = ""
+        self._send_options: dict | None = None
+        self._emoticon_panel: EmoticonPanel | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
         self._drag_origin: QPoint | None = None
@@ -520,6 +740,9 @@ class FloatingWindow(QWidget):
         self._style_hints = QGuiApplication.styleHints()
         self._style_hints.colorSchemeChanged.connect(self._on_system_theme_changed)
 
+        # 先把上次那个房间的表情和可用颜色取回来，免得第一次点开才发现不能用
+        QTimer.singleShot(0, self._refresh_room_context)
+
     # ----- theme -----
 
     def _apply_theme(self, theme: str | None = None, clear: bool = True) -> None:
@@ -537,6 +760,10 @@ class FloatingWindow(QWidget):
             self.room_arrow.setStyleSheet(
                 f"color:{colors['arrow']}; background:transparent; font-size:13px;"
             )
+        if hasattr(self, "mode_arrow"):
+            self.mode_arrow.setStyleSheet(
+                f"color:{colors['arrow']}; background:transparent; font-size:11px;"
+            )
         for handle in self._drag_handles.values():
             handle.setStyleSheet(
                 f"QLabel#grip {{ color: {colors['grip']}; font-size: 12px; }}"
@@ -546,6 +773,10 @@ class FloatingWindow(QWidget):
         self._fmt_time.setForeground(QColor(colors["time"]))
         self._fmt_sc.setForeground(QColor(colors["price"]))
         self._fmt_sys.setForeground(QColor(colors["time"]))
+
+        panel = getattr(self, "_emoticon_panel", None)
+        if panel is not None:
+            panel.apply_theme(colors)
 
         if clear:
             for view in (self.danmaku, self.event_view, self.sc_view):
@@ -665,13 +896,42 @@ class FloatingWindow(QWidget):
     def _build_send_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        row.setSpacing(5)
 
         self.send_input = QLineEdit()
         self.send_input.setPlaceholderText("在这发弹幕，Enter 发送（最多 20 字）")
         self.send_input.setMaxLength(SEND_MAX_LEN)
         self.send_input.returnPressed.connect(self._on_send)
         row.addWidget(self.send_input, 1)
+
+        self.emote_btn = QPushButton("表情")
+        self.emote_btn.setObjectName("ghost")
+        self.emote_btn.setFixedWidth(38)
+        self.emote_btn.setToolTip("B 站表情（含本房间专属和账号已解锁的表情包）")
+        self.emote_btn.clicked.connect(self._open_emoticons)
+        row.addWidget(self.emote_btn)
+
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(26, 26)
+        self.color_btn.setToolTip("弹幕颜色")
+        self.color_btn.clicked.connect(self._open_color_menu)
+        row.addWidget(self.color_btn)
+        self._paint_color_btn()
+
+        self.mode_box = QComboBox()
+        self.mode_box.setFixedWidth(62)
+        self.mode_box.setToolTip("弹幕位置")
+        for mode, label in MODES:
+            self.mode_box.addItem(label, mode)
+        index = self.mode_box.findData(int(self.cfg.get("send_mode", 1)))
+        self.mode_box.setCurrentIndex(index if index >= 0 else 0)
+        self.mode_box.currentIndexChanged.connect(self._on_send_mode_changed)
+        row.addWidget(self.mode_box)
+        # QSS 里把默认箭头去掉了（暗色主题下是黑图），自己贴一个跟着主题变色
+        self.mode_arrow = QLabel("▾", self.mode_box)
+        self.mode_arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.mode_arrow.setAlignment(Qt.AlignCenter)
+        self.mode_arrow.setGeometry(44, 0, 16, 26)
 
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
@@ -680,6 +940,263 @@ class FloatingWindow(QWidget):
         self.send_btn.setToolTip(self._send_hint())
         row.addWidget(self.send_btn)
         return row
+
+    # ----- 发送选项：位置 / 颜色 -----
+
+    def _send_mode(self) -> int:
+        return int(self.mode_box.currentData() or 1)
+
+    def _on_send_mode_changed(self) -> None:
+        self.cfg["send_mode"] = self._send_mode()
+        self._save_config_quiet()
+
+    def _paint_color_btn(self) -> None:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(f"#{self.send_color:06x}"))
+        # 白块在浅色主题、黑块在暗色主题都会糊掉，统一描一圈灰边
+        painter.setPen(QColor("#8a93a3"))
+        painter.drawRoundedRect(1, 1, 14, 14, 3, 3)
+        painter.end()
+        self.color_btn.setIcon(QIcon(pixmap))
+        self.color_btn.setToolTip(f"弹幕颜色 #{self.send_color:06x}")
+
+    def _set_send_color(self, value: int, save: bool = True) -> None:
+        self.send_color = int(value) & 0xFFFFFF
+        self._paint_color_btn()
+        if save:
+            self.cfg["send_color"] = self.send_color
+            self._save_config_quiet()
+
+    def _color_choices(self) -> list[tuple[str, int]]:
+        """本房间这个账号能用的颜色；拿不到配置就退回内置色板。"""
+        options = self._send_options or {}
+        colors = [
+            (item["name"] or f"#{item['color']:06x}", item["color"])
+            for item in options.get("colors") or []
+            if item.get("status")
+        ]
+        return colors or list(COLOR_PRESETS)
+
+    def _open_color_menu(self) -> None:
+        menu = QMenu(self)
+        options = self._send_options or {}
+        choices = self._color_choices()
+        total = len(options.get("colors") or [])
+
+        note = QAction(f"本房间可用 {len(choices)} 种颜色", menu)
+        note.setEnabled(False)
+        if not total:
+            note.setText("未取到房间配置，先给默认色板")
+        elif len(choices) == 1:
+            note.setText("该房间只允许这一种颜色")
+        menu.addAction(note)
+        menu.addSeparator()
+
+        holder = QWidget()
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(8, 6, 8, 4)
+        grid.setSpacing(4)
+        for i, (name, value) in enumerate(choices):
+            swatch = QPushButton()
+            swatch.setFixedSize(20, 20)
+            swatch.setToolTip(f"{name} #{value:06x}")
+            swatch.setCursor(Qt.PointingHandCursor)
+            swatch.setStyleSheet(
+                f"background:#{value:06x}; border:1px solid rgba(128,128,128,110);"
+                " border-radius:4px; padding:0;"
+            )
+            swatch.clicked.connect(
+                lambda _=False, v=value: (self._set_send_color(v), menu.close())
+            )
+            grid.addWidget(swatch, i // 5, i % 5)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(holder)
+        menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction("自定义颜色…", self._pick_custom_color)
+        menu.exec(self.color_btn.mapToGlobal(QPoint(0, self.color_btn.height() + 2)))
+
+    def _pick_custom_color(self) -> None:
+        picked = QColorDialog.getColor(
+            QColor(f"#{self.send_color:06x}"), self, "弹幕颜色"
+        )
+        if picked.isValid():
+            self._set_send_color(picked.rgb() & 0xFFFFFF)
+
+    # ----- 表情 -----
+
+    def _emoticon_cache_path(self, room: int) -> str:
+        base = os.path.join(os.path.dirname(self.config_path), "cache")
+        return os.path.join(base, f"emoticons_{int(room)}.json")
+
+    def _emoticon_room(self) -> int:
+        room = self._send_room()
+        if room:
+            return room
+        rooms = self.cfg.get("rooms") or []
+        return int(rooms[0]) if rooms else 0
+
+    def _open_emoticons(self) -> None:
+        if self._emoticon_panel is None:
+            self._emoticon_panel = EmoticonPanel(self._emote_images, self)
+            self._emoticon_panel.picked.connect(self._on_emoticon_picked)
+        self._emoticon_panel.apply_theme(self._c)
+
+        self._refresh_room_context()
+        self._emoticon_panel.set_packages(
+            self._emote_packages, self._emote_message or "正在拉取表情…"
+        )
+        self._emoticon_panel.popup_at(self.emote_btn)
+
+    def _refresh_room_context(self, force: bool = False) -> None:
+        """房间变了就重拉表情包和可用颜色/位置。"""
+        room = self._emoticon_room()
+        if not room:
+            return
+        if not force and room == self._emote_room:
+            return
+        self._request_room_context(room)
+
+    def _request_room_context(self, room: int) -> None:
+        self._emote_room = room
+        self._emote_message = ""
+        self._emote_packages = self._read_emoticon_cache(room)
+        self._send_options = None
+        if self._context_future is not None:
+            return
+        if not self.sender.has_login:
+            self._emote_message = "未配置 cookie，拉不到表情包"
+            return
+        if not self._emote_packages:
+            self._emote_message = "正在拉取表情…"
+        self._context_future = self._emote_pool.submit(self._fetch_room_context, room)
+
+    def _fetch_room_context(self, room: int) -> tuple[list[dict], dict | None, str]:
+        """后台线程：表情包 + 可用颜色/位置。两者互不影响，缺一个另一个照用。"""
+        packages: list[dict] = []
+        error = ""
+        try:
+            packages = self.sender.fetch_emoticons(room)
+        except SendError as exc:
+            error = str(exc)
+        try:
+            options: dict | None = self.sender.fetch_send_config(room)
+        except SendError:
+            options = None
+        return packages, options, error
+
+    def _apply_send_options(self) -> None:
+        """按服务端给的可用性收窄位置下拉和颜色面板。"""
+        options = self._send_options or {}
+
+        modes = [item for item in options.get("modes") or [] if item.get("status")]
+        if modes:
+            keep = self._send_mode()
+            self.mode_box.blockSignals(True)
+            self.mode_box.clear()
+            for item in modes:
+                self.mode_box.addItem(item["name"] or str(item["mode"]), item["mode"])
+            index = self.mode_box.findData(keep)
+            self.mode_box.setCurrentIndex(index if index >= 0 else 0)
+            self.mode_box.blockSignals(False)
+            only_one = len(modes) == 1
+            self.mode_box.setEnabled(not only_one)
+            self.mode_box.setToolTip(
+                f"该房间只开放「{modes[0]['name']}」" if only_one else "弹幕位置"
+            )
+            self.cfg["send_mode"] = self._send_mode()
+
+        colors = [item for item in options.get("colors") or [] if item.get("status")]
+        if colors and not any(item["color"] == self.send_color for item in colors):
+            # 当前选的颜色房间里不给用，服务端会悄悄改白色，不如直接切成可用的
+            self._set_send_color(colors[0]["color"])
+
+    def _on_emoticon_picked(self, item: dict) -> None:
+        if self._emoticon_panel is not None:
+            self._emoticon_panel.hide()
+        text = str(item.get("text") or "")
+        msg = str(item.get("msg") or text)
+        dm_type = int(item.get("dm_type") or 0)
+        current = self.send_input.text().strip()
+        if current:
+            # 已经在写别的：插到光标处，让人接着写完再一起发
+            if len(current) + len(text) > SEND_MAX_LEN:
+                self._append_sys(
+                    f"一条最多 {SEND_MAX_LEN} 字，先把输入框里的发掉或删几个字再插表情"
+                )
+                return
+            self.send_input.insert(text)
+            self.send_input.setFocus()
+            return
+        # 输入框空着就是要发表情，直接发，绕开输入框的长度截断
+        self._submit_send(msg, display=text, dm_type=dm_type)
+
+    def _poll_room_context(self) -> None:
+        if self._context_future is None or not self._context_future.done():
+            return
+        future, self._context_future = self._context_future, None
+        room = self._emote_room
+        try:
+            packages, options, error = future.result()
+        except Exception as exc:  # noqa: BLE001 - 界面不能因为拉不到表情挂掉
+            packages, options, error = [], None, f"{type(exc).__name__}: {exc}"
+
+        if room != self._emote_room:
+            # 拉的过程中又换了房间，这批结果作废，按新房间重来
+            self._request_room_context(self._emote_room)
+            return
+
+        if options:
+            self._send_options = options
+            self._apply_send_options()
+        if packages:
+            self._emote_packages = packages
+            self._emote_message = ""
+            self._write_emoticon_cache(room, packages)
+        else:
+            self._emote_message = error or "没有可用表情"
+            self._emote_room = 0  # 下次点表情可以重试
+
+        if self._emoticon_panel is not None and self._emoticon_panel.isVisible():
+            self._emoticon_panel.set_packages(
+                self._emote_packages, self._emote_message or "没有可用表情"
+            )
+
+    def _read_emoticon_cache(self, room: int) -> list[dict]:
+        if not room:
+            return []
+        try:
+            with open(self._emoticon_cache_path(room), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if not isinstance(packages, list):
+            return []
+        for pkg in packages:
+            if not isinstance(pkg, dict) or not isinstance(pkg.get("items"), list):
+                return []
+        return packages
+
+    def _write_emoticon_cache(self, room: int, packages: list[dict]) -> None:
+        if not room or not packages:
+            return
+        path = self._emoticon_cache_path(room)
+        temp = path + ".part"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(temp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"fetched": int(time.time()), "packages": packages},
+                    fh,
+                    ensure_ascii=False,
+                )
+            os.replace(temp, path)
+        except OSError:
+            pass
 
     def _send_hint(self) -> str:
         if not self.sender.has_login:
@@ -690,6 +1207,11 @@ class FloatingWindow(QWidget):
     def _reload_sender(self) -> None:
         """设置里改过 cookie 后重建发送器，不必重启。"""
         self.sender = DanmakuSender(self.cfg)
+        # 换账号意味着表情包和可用颜色都可能完全不同，缓存作废，重新拉
+        self._emote_room = 0
+        self._emote_packages = []
+        self._emote_message = ""
+        self._send_options = None
         self.send_btn.setToolTip(self._send_hint())
 
     def _send_room(self) -> int:
@@ -700,10 +1222,12 @@ class FloatingWindow(QWidget):
         return int(raw) if raw.isdigit() else 0
 
     def _on_send(self) -> None:
-        if self._send_future is not None:
-            return
         text = self.send_input.text().strip()
-        if not text:
+        if text:
+            self._submit_send(text)
+
+    def _submit_send(self, msg: str, *, display: str = "", dm_type: int = 0) -> None:
+        if self._send_future is not None:
             return
         room = self._send_room()
         if not room:
@@ -713,17 +1237,22 @@ class FloatingWindow(QWidget):
         self.send_btn.setText("发送中…")
         # 没连采集时看不到服务端回显，成功后就自己提示一句
         self._send_offline = not self.state.real_room
-        self._send_future = self._send_pool.submit(self._send_worker, room, text)
+        self._send_future = self._send_pool.submit(
+            self._send_worker, room, msg, self.send_color, self._send_mode(), dm_type,
+            display or msg,
+        )
 
-    def _send_worker(self, room: int, text: str) -> tuple[bool, str]:
-        """在后台线程发，绝不碰界面；返回 ``(成功?, 文本/错误)``。"""
+    def _send_worker(
+        self, room: int, msg: str, color: int, mode: int, dm_type: int, display: str
+    ) -> tuple[bool, str]:
+        """在后台线程发，绝不碰界面；返回 ``(成功?, 用于提示的文本/错误)``。"""
         try:
             if not self.sender.uname:
                 ok, info = self.sender.verify()
                 if not ok:
                     return False, info
-            self.sender.send(room, text)
-            return True, text
+            self.sender.send(room, msg, color=color, mode=mode, dm_type=dm_type)
+            return True, display
         except SendError as exc:
             return False, str(exc)
         except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
@@ -1190,6 +1719,8 @@ class FloatingWindow(QWidget):
 
         self.cfg["rooms"] = [room]
         self._remember_room(room)
+        # 换房间后可用颜色/位置和表情包都可能不同，重拉一次
+        self._refresh_room_context(force=True)
         self.service.start(self.cfg, room)
 
     def _disconnect(self) -> None:
@@ -1403,6 +1934,7 @@ class FloatingWindow(QWidget):
 
     def _tick(self) -> None:
         self._poll_send()
+        self._poll_room_context()
 
         batch: list[dict] = []
         for _ in range(MAX_EVENTS_PER_TICK):
@@ -1850,7 +2382,11 @@ class FloatingWindow(QWidget):
         self.timer.stop()
         self._image_timer.stop()
         self._images.stop()
+        self._emote_images.stop()
         self._send_pool.shutdown(wait=False)
+        self._emote_pool.shutdown(wait=False, cancel_futures=True)
+        if self._emoticon_panel is not None:
+            self._emoticon_panel.close()
         self.cfg["split"] = self._layout_sizes()
         self.cfg["window"] = {"x": self.x(), "y": self.y()}
         try:
