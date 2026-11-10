@@ -31,6 +31,13 @@ data/
 # ---- 临时导出 ----
 exports/
 
+# ---- 图片缓存 ----
+# cache/images 是头像与表情的下载缓存，纯派生数据，删了下次自动重建
+cache/
+
+# ---- 临时草稿 ----
+.tmp/
+
 # ---- 系统文件 ----
 Thumbs.db
 Desktop.ini

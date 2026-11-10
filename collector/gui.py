@@ -14,8 +14,8 @@ from datetime import datetime
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QGuiApplication, QTextBlockUserData,
-    QTextCharFormat, QTextCursor,
+    QAction, QColor, QDesktopServices, QGuiApplication, QImage, QTextBlockUserData,
+    QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -28,6 +28,7 @@ from .bili_api import BiliApi
 from .collector import RoomCollector
 from .config import DEFAULTS
 from .fixtures import JPN_AFTER, JPN_BEFORE, load_replay
+from .images import ImageLoader
 from .storage import Storage, export_csv, export_ndjson, extract_sc
 
 TITLE = "SC Collector · 外挂弹幕机"
@@ -37,6 +38,11 @@ MAX_SC_BLOCKS = 600
 MAX_EVENTS_PER_TICK = 400
 MAX_DANMAKU_PER_TICK = 150
 TICK_MS = 30
+# 头像/表情最多等这么久再上屏；超时先按文字发出去，图下完再补画那一行
+IMAGE_WAIT_SECONDS = 0.4
+MAX_PENDING_DANMAKU = 200
+AVATAR_PX = 16
+EMOTE_PX = 20
 
 
 # ---------------- config helpers ----------------
@@ -70,6 +76,9 @@ def load_gui_config(path: str) -> dict:
 
 
 def save_gui_config(path: str, config: dict) -> None:
+    # 模板不落盘：config.example.json 是要入库的样板，混进窗口坐标和绝对路径就废了
+    if os.path.basename(path).endswith(".example.json"):
+        return
     payload = {key: value for key, value in config.items() if key != "config_dir"}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
@@ -99,6 +108,15 @@ class ScBlockData(QTextBlockUserData):
     def __init__(self, sc_id: str) -> None:
         super().__init__()
         self.sc_id = sc_id
+
+
+class DanmakuBlockData(QTextBlockUserData):
+    """挂在一行弹幕上：图片还没下完，等到了再补画这一行。"""
+
+    def __init__(self, row: dict, pending: list[str]) -> None:
+        super().__init__()
+        self.row = row
+        self.pending = pending
 
 
 class CollectorService:
@@ -450,6 +468,11 @@ class FloatingWindow(QWidget):
         self._c = THEME_COLORS[self.theme]
         self.service = CollectorService()
         self.state = RoomState(input_room=0)
+        self._images = ImageLoader(
+            os.path.join(os.path.dirname(self.config_path), "cache", "images")
+        )
+        self._danmaku_pending: list[dict] = []
+        self._pending_images = 0
         self._drag_origin: QPoint | None = None
         self._dropped = 0
         self._panes: dict[str, QWidget] = {}
@@ -476,6 +499,11 @@ class FloatingWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(TICK_MS)
+
+        # 图片到齐的弹幕不会立刻上屏，由这个定时器接力补发，顺便补画迟到的头像
+        self._image_timer = QTimer(self)
+        self._image_timer.timeout.connect(self._on_image_timer)
+        self._image_timer.start(120)
 
         self._split_timer = QTimer(self)
         self._split_timer.setSingleShot(True)
@@ -787,6 +815,8 @@ class FloatingWindow(QWidget):
 
     def _clear_danmaku(self) -> None:
         self.danmaku.clear()
+        self._danmaku_pending.clear()
+        self._pending_images = 0
         self.state.messages = 0
         self._dropped = 0
         self.danmaku_title.setText("弹幕 0")
@@ -1378,20 +1408,129 @@ class FloatingWindow(QWidget):
     # ----- rendering -----
 
     def _append_danmaku_batch(self, rows: list[dict]) -> None:
+        now = time.monotonic()
+        for row in rows:
+            row["_queued_at"] = now
+            for url in self._row_image_urls(row):
+                self._images.want(url)
+            self._danmaku_pending.append(row)
+        if len(self._danmaku_pending) > MAX_PENDING_DANMAKU:
+            # 积压说明图片一直在超时，别让画面跟着等，全按文字先发出去
+            for row in self._danmaku_pending:
+                row["_queued_at"] = 0.0
+        self._flush_danmaku()
+
+    @staticmethod
+    def _row_image_urls(row: dict) -> list[str]:
+        urls = [row.get("face") or ""]
+        if row.get("is_emoticon"):
+            urls.append(row.get("emote_url") or "")
+        return [url for url in urls if url]
+
+    def _flush_danmaku(self) -> None:
+        """按到达顺序上屏；队头还在等图就停住，避免后面的弹幕插队。"""
+        if not self._danmaku_pending:
+            return
+        now = time.monotonic()
+        ready: list[dict] = []
+        while self._danmaku_pending and len(ready) < MAX_DANMAKU_PER_TICK:
+            row = self._danmaku_pending[0]
+            if now - row.get("_queued_at", now) < IMAGE_WAIT_SECONDS:
+                if any(not self._images.settled(url) for url in self._row_image_urls(row)):
+                    break
+            ready.append(self._danmaku_pending.pop(0))
+        if ready:
+            self._insert_danmaku(ready)
+
+    def _insert_danmaku(self, rows: list[dict]) -> None:
+        document = self.danmaku.document()
         scrollbar = self.danmaku.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
 
-        cursor = QTextCursor(self.danmaku.document())
+        cursor = QTextCursor(document)
         cursor.movePosition(QTextCursor.End)
         cursor.beginEditBlock()
         for row in rows:
+            urls = self._row_image_urls(row)
+            for url in urls:
+                image = self._images.image(url)
+                if image is not None:
+                    # 挂到原始 URL 上，HTML 里的 <img src> 就能直接取到
+                    document.addResource(
+                        QTextDocument.ResourceType.ImageResource, QUrl(url), image
+                    )
             if cursor.position() > 0:
                 cursor.insertBlock()
             cursor.insertHtml(self._danmaku_html(row))
+
+            pending = [url for url in urls if not self._images.settled(url)]
+            if pending:
+                # 图还没到，先按文字显示，等下一轮补画这一行
+                cursor.block().setUserData(DanmakuBlockData(row, pending))
+                self._pending_images += 1
         cursor.endEditBlock()
 
         if at_bottom:
             scrollbar.setValue(scrollbar.maximum())
+
+    def _on_image_timer(self) -> None:
+        self._flush_danmaku()
+        self._refresh_danmaku_images()
+
+    def _refresh_danmaku_images(self) -> None:
+        """迟到的头像/表情：把对应那一行重画一遍。"""
+        if self._pending_images <= 0:
+            return
+        document = self.danmaku.document()
+        ready: list[tuple[int, dict]] = []
+        still_waiting = 0
+        block = document.begin()
+        while block.isValid():
+            data = block.userData()
+            if isinstance(data, DanmakuBlockData):
+                if all(self._images.settled(url) for url in data.pending):
+                    ready.append((block.blockNumber(), data.row))
+                else:
+                    still_waiting += 1
+            block = block.next()
+        # 被 maximumBlockCount 截掉的行不会再来，计数以这次实际扫描为准
+        self._pending_images = still_waiting
+
+        for number, row in ready:
+            target = document.findBlockByNumber(number)
+            if target.isValid():
+                target.setUserData(None)
+                self._rebuild_danmaku_block(target, row)
+
+    def _rebuild_danmaku_block(self, block, row: dict) -> None:
+        document = self.danmaku.document()
+        for url in self._row_image_urls(row):
+            image = self._images.image(url)
+            if image is not None:
+                document.addResource(
+                    QTextDocument.ResourceType.ImageResource, QUrl(url), image
+                )
+        scrollbar = self.danmaku.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        cursor.beginEditBlock()
+        cursor.removeSelectedText()
+        cursor.insertHtml(self._danmaku_html(row))
+        cursor.endEditBlock()
+
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+
+    @staticmethod
+    def _image_size(image: QImage, height: int) -> tuple[int, int]:
+        """按目标高度等比算宽高，QTextDocument 只认固定的 px 尺寸。"""
+        if image.height() <= 0:
+            return height, height
+        width = max(1, round(height * image.width() / image.height()))
+        return width, height
 
     def _danmaku_html(self, row: dict) -> str:
         event_time = row.get("event_time") or 0
@@ -1401,6 +1540,14 @@ class FloatingWindow(QWidget):
             else datetime.now().strftime("%H:%M:%S")
         )
         parts = [f'<span style="color:{self._c["time"]}">{stamp}</span>']
+
+        face = row.get("face") or ""
+        avatar = self._images.image(face)
+        if avatar is not None:
+            width, height = self._image_size(avatar, AVATAR_PX)
+            parts.append(
+                f'<img src="{html.escape(face)}" width="{width}" height="{height}">'
+            )
 
         medal = row.get("medal_name") or ""
         if medal:
@@ -1428,7 +1575,16 @@ class FloatingWindow(QWidget):
 
         text = html.escape(row.get("text") or "")
         if row.get("is_emoticon"):
-            parts.append(f'<span style="color:{self._c["emoticon"]}">[{text}]</span>')
+            emote_url = row.get("emote_url") or ""
+            emote = self._images.image(emote_url)
+            if emote is not None:
+                width, height = self._image_size(emote, EMOTE_PX)
+                parts.append(
+                    f'<img src="{html.escape(emote_url)}" width="{width}" height="{height}">'
+                )
+            else:
+                # 图还没到或下载失败，先按原来的青色 [名字] 显示
+                parts.append(f'<span style="color:{self._c["emoticon"]}">[{text}]</span>')
         else:
             parts.append(f'<span style="color:{self._c["text"]}">{text}</span>')
         return " ".join(parts)
@@ -1499,6 +1655,11 @@ class FloatingWindow(QWidget):
 
         uname = html.escape(row.get("uname") or "")
         uid = row.get("uid") or 0
+        face = row.get("face") or ""
+        avatar = self._images.image(face)
+        if avatar is not None:
+            width, height = self._image_size(avatar, AVATAR_PX)
+            parts.append(f'<img src="{html.escape(face)}" width="{width}" height="{height}">')
         if uid:
             parts.append(
                 f'<a href="https://space.bilibili.com/{uid}" '
@@ -1518,6 +1679,8 @@ class FloatingWindow(QWidget):
         return " ".join(parts)
 
     def _append_sc(self, row: dict) -> None:
+        # SC 不排队等图：译文可能随后就到，插块顺序不能乱；先预取，下次同一个人就能带上头像
+        self._images.want(row.get("face"))
         scrollbar = self.sc_view.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
 
@@ -1597,6 +1760,8 @@ class FloatingWindow(QWidget):
         if self._mock_stop is not None:
             self._mock_stop.set()
         self.timer.stop()
+        self._image_timer.stop()
+        self._images.stop()
         self.cfg["split"] = self._layout_sizes()
         self.cfg["window"] = {"x": self.x(), "y": self.y()}
         try:

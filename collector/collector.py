@@ -45,6 +45,8 @@ def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
     if not guard_level:
         guard_level = int((user_node.get("guard") or {}).get("level") or 0)
 
+    emote = _emoticon_node(info[0])
+
     return {
         "room_id": room_id,
         "uid": uid,
@@ -56,8 +58,16 @@ def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
         "medal_level": int(medal.get("level") or 0),
         "guard_level": guard_level,
         "is_admin": 1 if len(profile) > 2 and profile[2] else 0,
-        "is_emoticon": 1 if _emoticon_node(info[0]) else 0,
+        # 两个图片地址只给界面用，不入库；匿名连接下昵称会被打码，头像地址仍然是完整的
+        "face": _https(base.get("face") or ""),
+        "is_emoticon": 1 if emote else 0,
+        "emote_url": _https(emote.get("url") or ""),
     }
+
+
+def _https(url: str) -> str:
+    """B站有时回 http 的图床地址，统一升级成 https，免得混用协议。"""
+    return url.replace("http://", "https://", 1) if url.startswith("http://") else url
 
 
 def _emoticon_node(head: object) -> dict:

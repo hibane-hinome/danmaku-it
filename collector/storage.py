@@ -136,6 +136,8 @@ def extract_sc(room_id: int, data: dict, received_at_ms: int) -> dict | None:
         "room_id": room_id,
         "uid": _to_int(data.get("uid")),
         "uname": user_info.get("uname"),
+        # 只给界面显示头像用，不入库（库里没有这一列，insert_sc 按显式字段取值）
+        "face": user_info.get("face") or "",
         "price": _to_int(data.get("price")),
         "message": data.get("message"),
         # 少数情况下 SUPER_CHAT_MESSAGE 本体就带译文（多数房间靠随后的 _JPN 消息补）
