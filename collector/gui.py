@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -29,6 +30,8 @@ from .collector import RoomCollector
 from .config import DEFAULTS
 from .fixtures import JPN_AFTER, JPN_BEFORE, load_replay
 from .images import ImageLoader
+from .sender import MAX_LEN as SEND_MAX_LEN
+from .sender import DanmakuSender, SendError
 from .storage import Storage, export_csv, export_ndjson, extract_sc
 
 TITLE = "SC Collector · 外挂弹幕机"
@@ -470,6 +473,11 @@ class FloatingWindow(QWidget):
         self._images = ImageLoader(
             os.path.join(os.path.dirname(self.config_path), "cache", "images")
         )
+        # 发弹幕：只读 cookie 不联网，首次发送时再在后台线程 verify
+        self.sender = DanmakuSender(self.cfg)
+        self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
+        self._send_future: Future | None = None
+        self._send_offline = False
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
         self._drag_origin: QPoint | None = None
@@ -614,6 +622,8 @@ class FloatingWindow(QWidget):
         splitter.setSizes([340, 170, 150])
         root.addWidget(splitter, 1)
 
+        root.addLayout(self._build_send_row())
+
         grip_row = QHBoxLayout()
         grip_row.setContentsMargins(0, 0, 0, 0)
         grip_row.addStretch(1)
@@ -651,6 +661,96 @@ class FloatingWindow(QWidget):
         close_btn.clicked.connect(self.close)
         header.addWidget(close_btn)
         return header
+
+    def _build_send_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        self.send_input = QLineEdit()
+        self.send_input.setPlaceholderText("在这发弹幕，Enter 发送（最多 20 字）")
+        self.send_input.setMaxLength(SEND_MAX_LEN)
+        self.send_input.returnPressed.connect(self._on_send)
+        row.addWidget(self.send_input, 1)
+
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setObjectName("primary")
+        self.send_btn.setProperty("active", "false")
+        self.send_btn.clicked.connect(self._on_send)
+        self.send_btn.setToolTip(self._send_hint())
+        row.addWidget(self.send_btn)
+        return row
+
+    def _send_hint(self) -> str:
+        if not self.sender.has_login:
+            return "未配置 cookie（config.json 的 cookie_file），只能收不能发"
+        who = f"以 {self.sender.uname} 的身份发送" if self.sender.uname else "用 cookie 对应的账号发送"
+        return f"{who}；B 站限制 {SEND_MAX_LEN} 字、约 5 秒一条"
+
+    def _reload_sender(self) -> None:
+        """设置里改过 cookie 后重建发送器，不必重启。"""
+        self.sender = DanmakuSender(self.cfg)
+        self.send_btn.setToolTip(self._send_hint())
+
+    def _send_room(self) -> int:
+        """发送目标：优先用已连上的真实房间号，否则用输入框里填的。"""
+        if self.state.real_room:
+            return self.state.real_room
+        raw = self.room_input.currentText().strip()
+        return int(raw) if raw.isdigit() else 0
+
+    def _on_send(self) -> None:
+        if self._send_future is not None:
+            return
+        text = self.send_input.text().strip()
+        if not text:
+            return
+        room = self._send_room()
+        if not room:
+            self._append_sys("发送失败：还没连上直播间，先点「连接」或填个房间号")
+            return
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("发送中…")
+        # 没连采集时看不到服务端回显，成功后就自己提示一句
+        self._send_offline = not self.state.real_room
+        self._send_future = self._send_pool.submit(self._send_worker, room, text)
+
+    def _send_worker(self, room: int, text: str) -> tuple[bool, str]:
+        """在后台线程发，绝不碰界面；返回 ``(成功?, 文本/错误)``。"""
+        try:
+            if not self.sender.uname:
+                ok, info = self.sender.verify()
+                if not ok:
+                    return False, info
+            self.sender.send(room, text)
+            return True, text
+        except SendError as exc:
+            return False, str(exc)
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _poll_send(self) -> None:
+        if self._send_future is None or not self._send_future.done():
+            return
+        future, self._send_future = self._send_future, None
+        try:
+            ok, payload = future.result()
+        except Exception as exc:  # noqa: BLE001 - worker 之外的意外，也要回到可发送状态
+            ok, payload = False, f"{type(exc).__name__}: {exc}"
+
+        self.send_btn.setEnabled(True)
+        self.send_btn.setText("发送")
+        self.send_btn.setToolTip(self._send_hint())
+        if ok:
+            # 只有内容没被改过才清空，避免把用户新打的字冲掉
+            if self.send_input.text().strip() == payload:
+                self.send_input.clear()
+            if self._send_offline:
+                self._append_sys(f"已发送（未连采集，看不到回显）：{payload}")
+            self.send_btn.setText("已发送")
+            QTimer.singleShot(1200, lambda: self.send_btn.setText("发送"))
+        else:
+            self._append_sys(f"发送失败：{payload}")
 
     def _build_danmaku_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -1302,6 +1402,8 @@ class FloatingWindow(QWidget):
     # ----- event pump -----
 
     def _tick(self) -> None:
+        self._poll_send()
+
         batch: list[dict] = []
         for _ in range(MAX_EVENTS_PER_TICK):
             try:
@@ -1748,6 +1850,7 @@ class FloatingWindow(QWidget):
         self.timer.stop()
         self._image_timer.stop()
         self._images.stop()
+        self._send_pool.shutdown(wait=False)
         self.cfg["split"] = self._layout_sizes()
         self.cfg["window"] = {"x": self.x(), "y": self.y()}
         try:
@@ -1898,6 +2001,7 @@ class Dialog(QDialog):
             "theme": theme,
         })
         owner.danmaku.document().setMaximumBlockCount(self.max_blocks.value())
+        owner._reload_sender()
         owner._apply_theme(resolve_theme(theme))
         save_gui_config(owner.config_path, owner.cfg)
         if self.topmost.isChecked() != owner.pin_btn.isChecked():
