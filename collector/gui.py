@@ -155,11 +155,13 @@ class CollectorService:
             "enter": True, "gift": True, "guard": True, "delete": True,
         }
 
-    def start(self, config: dict, room: int) -> None:
+    def start(self, config: dict, room: int, cookies: dict | None = None) -> None:
         if self.running:
             return
         self.running = True
-        config = dict(config, rooms=[room])
+        # 采集也走选中的账号：匿名连接会让 B 站把用户名打成 ***，而且下发的
+        # 弹幕明显更少（实测同一房间 10 秒：匿名 13 条 / 登录 40 条）
+        config = dict(config, rooms=[room], collector_cookies=dict(cookies or {}))
         self._thread = threading.Thread(target=self._thread_main, args=(config,), daemon=True)
         self._thread.start()
 
@@ -180,6 +182,7 @@ class CollectorService:
         storage = Storage(config["database"])
         api = BiliApi(
             user_agent=config["user_agent"],
+            cookies=config.get("collector_cookies") or None,
             cookie_file=config.get("cookie_file", ""),
             sessdata=config.get("sessdata", ""),
             dede_user_id=config.get("dede_user_id", ""),
@@ -206,10 +209,18 @@ class CollectorService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             storage.close()
+            self._loop = None
+            self._stop = None
 
     def stop(self, timeout: float = 8.0) -> None:
-        if self._loop and self._stop:
-            self._loop.call_soon_threadsafe(self._stop.set)
+        # 线程已经退出时 loop 可能已经关掉了，再 call_soon_threadsafe 会抛
+        # "Event loop is closed"——按一下断开、线程刚好自己停完就会撞上
+        loop, stop_event = self._loop, self._stop
+        if loop is not None and stop_event is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(stop_event.set)
+            except RuntimeError:
+                pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
 
@@ -1136,6 +1147,7 @@ class FloatingWindow(QWidget):
 
     def _use_account(self, account) -> None:
         """换成这个账号：重建发送器，表情包、可用颜色、粉丝牌全部作废重拉。"""
+        was_connected = bool(self.state.real_room)
         self.sender = DanmakuSender(self.cfg, account)
         self._sender_path = account.path if account is not None else ""
         self._emote_room = 0
@@ -1150,6 +1162,9 @@ class FloatingWindow(QWidget):
             self._refresh_room_context(force=True)
             self._request_medals()
         self._request_account_meta()
+        # 采集用的身份是连接时定下的：正在收的时候换账号，得重连才会生效
+        if was_connected and (self.service.running or self._mock_thread is not None):
+            self._append_sys("已切换账号：点一次「断开」再「连接」，采集才会用这个身份")
 
     def _request_account_meta(self) -> None:
         """后台补昵称和头像；缓存还新鲜的账号不问 B 站。"""
@@ -2158,7 +2173,9 @@ class FloatingWindow(QWidget):
         self._remember_room(room)
         # 换房间后可用颜色/位置和表情包都可能不同，重拉一次
         self._refresh_room_context(force=True)
-        self.service.start(self.cfg, room)
+        # 有账号就带着它的 cookie 连：匿名连接用户名会是 ***，弹幕也明显少
+        cookies = self.sender.cookies() if self.sender.has_login else None
+        self.service.start(self.cfg, room, cookies=cookies)
 
     def _disconnect(self) -> None:
         self.connect_btn.setEnabled(False)
@@ -2409,6 +2426,17 @@ class FloatingWindow(QWidget):
                 self.state.title = event.get("title") or ""
                 self.title_label.setText(self.state.title or TITLE)
                 self._append_sys(f"已进入 {self.state.real_room} · {self.state.title}")
+                if self.sender.has_login:
+                    who = self.sender.uname or "账号"
+                    if self.sender.uname:
+                        self._append_sys(f"采集身份：{self.sender.uname}")
+                    self.dot.setToolTip(f"以 {who} 的身份采集")
+                else:
+                    self._append_sys(
+                        "匿名连接：部分房间会把用户名显示成 ***，"
+                        "在账号目录里放 cookie、选上账号后重连即可"
+                    )
+                    self.dot.setToolTip("匿名连接：部分房间的用户名会显示为 ***")
                 self._refresh_send_state()
                 self._request_medals()
             elif kind == "sys":

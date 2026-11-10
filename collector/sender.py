@@ -214,6 +214,13 @@ class DanmakuSender:
     def cookie_source(self) -> str:
         return "cookie 文件" if self._cookies else "未配置"
 
+    def cookies(self) -> dict:
+        """这份账号 cookie 的副本，用来把采集的连接也做成登录态。"""
+        items = dict(self._cookies)
+        if self._jct:
+            items["bili_jct"] = self._jct
+        return items
+
     def _cookie_header(self) -> str:
         items = dict(self._cookies)
         if self._jct:

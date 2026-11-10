@@ -42,6 +42,7 @@ class BiliApi:
         cookie_file: str = "",
         sessdata: str = "",
         dede_user_id: str = "",
+        cookies: dict | None = None,
     ) -> None:
         self.user_agent = user_agent
         self.timeout = timeout
@@ -50,7 +51,13 @@ class BiliApi:
         self._mixin_key: str | None = None
         self._mixin_key_at = 0.0
         self._cookies_ready = False
+        self.uname = ""
         self.load_cookie_file(cookie_file)
+        # Whole cookie dict (from the account picked in the GUI) wins over the file,
+        # so the danmaku socket runs as that account instead of an anonymous guest.
+        for name, value in (cookies or {}).items():
+            if name and value:
+                self._set_cookie(str(name), str(value))
         # Explicit values win over the cookie file so the GUI can override them.
         if sessdata:
             self._set_cookie("SESSDATA", sessdata)
@@ -143,6 +150,21 @@ class BiliApi:
                 self._set_cookie("buvid4", data["b_4"])
         except Exception:
             pass
+        # WS auth 的 uid 必须和 token 属于同一个账号。cookie 文件里少了
+        # DedeUserID（有些导出工具会漏）时，用 SESSDATA 问一次 nav 补上，
+        # 不然登录连接会被当成 uid=0 的游客。
+        if self.cookies().get("SESSDATA") and not self.cookies().get("DedeUserID"):
+            try:
+                nav = self._get_json(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    referer="https://www.bilibili.com/",
+                )
+                mid = (nav.get("data") or {}).get("mid")
+                if mid:
+                    self._set_cookie("DedeUserID", str(mid))
+                    self.uname = str((nav.get("data") or {}).get("uname") or "")
+            except Exception:
+                pass
         self._cookies_ready = True
 
     def _refresh_mixin_key(self) -> str:
