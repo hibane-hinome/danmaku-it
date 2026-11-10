@@ -58,7 +58,8 @@ def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
         "medal_level": int(medal.get("level") or 0),
         "guard_level": guard_level,
         "is_admin": 1 if len(profile) > 2 and profile[2] else 0,
-        # 两个图片地址只给界面用，不入库；匿名连接下昵称会被打码，头像地址仍然是完整的
+        # 图片地址只给界面用，不入库。界面目前只取 emote_url；
+        # face 保留在事件里（零成本，不下载），将来要加回头像不必再改这一层
         "face": _https(base.get("face") or ""),
         "is_emoticon": 1 if emote else 0,
         "emote_url": _https(emote.get("url") or ""),

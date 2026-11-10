@@ -38,10 +38,9 @@ MAX_SC_BLOCKS = 600
 MAX_EVENTS_PER_TICK = 400
 MAX_DANMAKU_PER_TICK = 150
 TICK_MS = 30
-# 头像/表情最多等这么久再上屏；超时先按文字发出去，图下完再补画那一行
+# 表情图最多等这么久再上屏；超时先按 [名字] 发出去，图下完再补画那一行
 IMAGE_WAIT_SECONDS = 0.4
 MAX_PENDING_DANMAKU = 200
-AVATAR_PX = 16
 EMOTE_PX = 20
 
 
@@ -500,7 +499,7 @@ class FloatingWindow(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start(TICK_MS)
 
-        # 图片到齐的弹幕不会立刻上屏，由这个定时器接力补发，顺便补画迟到的头像
+        # 表情到齐的弹幕不会立刻上屏，由这个定时器接力补发，顺便补画迟到的表情
         self._image_timer = QTimer(self)
         self._image_timer.timeout.connect(self._on_image_timer)
         self._image_timer.start(120)
@@ -1422,10 +1421,11 @@ class FloatingWindow(QWidget):
 
     @staticmethod
     def _row_image_urls(row: dict) -> list[str]:
-        urls = [row.get("face") or ""]
+        """只下载表情图。头像是一人一图、几乎不命中缓存，量大且没多少人看，不取。"""
         if row.get("is_emoticon"):
-            urls.append(row.get("emote_url") or "")
-        return [url for url in urls if url]
+            url = row.get("emote_url") or ""
+            return [url] if url else []
+        return []
 
     def _flush_danmaku(self) -> None:
         """按到达顺序上屏；队头还在等图就停住，避免后面的弹幕插队。"""
@@ -1478,7 +1478,7 @@ class FloatingWindow(QWidget):
         self._refresh_danmaku_images()
 
     def _refresh_danmaku_images(self) -> None:
-        """迟到的头像/表情：把对应那一行重画一遍。"""
+        """迟到的表情图：把对应那一行重画一遍。"""
         if self._pending_images <= 0:
             return
         document = self.danmaku.document()
@@ -1540,14 +1540,6 @@ class FloatingWindow(QWidget):
             else datetime.now().strftime("%H:%M:%S")
         )
         parts = [f'<span style="color:{self._c["time"]}">{stamp}</span>']
-
-        face = row.get("face") or ""
-        avatar = self._images.image(face)
-        if avatar is not None:
-            width, height = self._image_size(avatar, AVATAR_PX)
-            parts.append(
-                f'<img src="{html.escape(face)}" width="{width}" height="{height}">'
-            )
 
         medal = row.get("medal_name") or ""
         if medal:
@@ -1655,11 +1647,6 @@ class FloatingWindow(QWidget):
 
         uname = html.escape(row.get("uname") or "")
         uid = row.get("uid") or 0
-        face = row.get("face") or ""
-        avatar = self._images.image(face)
-        if avatar is not None:
-            width, height = self._image_size(avatar, AVATAR_PX)
-            parts.append(f'<img src="{html.escape(face)}" width="{width}" height="{height}">')
         if uid:
             parts.append(
                 f'<a href="https://space.bilibili.com/{uid}" '
@@ -1679,8 +1666,7 @@ class FloatingWindow(QWidget):
         return " ".join(parts)
 
     def _append_sc(self, row: dict) -> None:
-        # SC 不排队等图：译文可能随后就到，插块顺序不能乱；先预取，下次同一个人就能带上头像
-        self._images.want(row.get("face"))
+        # SC 不排队等图：译文可能随后就到，插块顺序不能乱
         scrollbar = self.sc_view.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
 
