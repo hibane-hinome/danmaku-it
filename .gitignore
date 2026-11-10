@@ -1,0 +1,37 @@
+# ---- 虚拟环境（237 MB）----
+.venv/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- 凭证：绝对不入库 ----
+# account.csv 是 Netscape 格式的 B 站 cookie，19 行里含登录态，泄露等于账号被接管
+account.csv
+*.cookie
+*.cookies
+
+# ---- 运行时配置 ----
+# config.json 含 sessdata / dede_user_id / cookie_file 绝对路径，以及窗口位置、
+# 房间列表这些只对本机有意义的东西。要给别人一份能跑的模板，另存 config.example.json。
+config.json
+config.json.bak*
+
+# ---- 日志 ----
+logs/
+
+# ---- 数据库 ----
+# 采集数据不可再生，靠 D:\MyDocument\live-archive-backup 做盘外备份，不进版本库
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# ---- 临时导出 ----
+exports/
+
+# ---- 系统文件 ----
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,6 @@
+# 源码统一 LF 存储，避免 Windows 检出成 CRLF 后与 Linux/CI 产生无意义的整文件差异
+* text=auto eol=lf
+
+# 批处理必须是 CRLF，cmd.exe 对 LF 结尾的 .bat 在某些分支语句上会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
