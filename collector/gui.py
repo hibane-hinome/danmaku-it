@@ -842,6 +842,9 @@ class FloatingWindow(QWidget):
         self._mock_stop: threading.Event | None = None
         # 0 号直播间：本地回放 + 本地回显发送，用来调试发送行
         self._test_mode = False
+        # 窗口尺寸落盘：还原完成前不许写，免得启动时的 resize 把旧值冲掉
+        self._geo_ready = False
+        self._geo_timer: QTimer | None = None
 
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
@@ -872,6 +875,13 @@ class FloatingWindow(QWidget):
         self._split_timer.setSingleShot(True)
         self._split_timer.setInterval(800)
         self._split_timer.timeout.connect(self._save_config_quiet)
+
+        # 拖宽高/挪位置也记，别只靠关窗那一下（进程被杀就丢了）
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.setInterval(600)
+        self._geo_timer.timeout.connect(self._store_geometry)
+        self._geo_ready = True
 
         self._style_hints = QGuiApplication.styleHints()
         self._style_hints.colorSchemeChanged.connect(self._on_system_theme_changed)
@@ -2189,10 +2199,60 @@ class FloatingWindow(QWidget):
     def _restore_geometry(self) -> None:
         geo = self.cfg.get("window")
         if isinstance(geo, dict):
-            try:
-                self.move(int(geo["x"]), int(geo["y"]))
-            except (KeyError, TypeError, ValueError):
-                pass
+            def _read(key: str) -> int | None:
+                try:
+                    return int(geo[key])
+                except (KeyError, TypeError, ValueError):
+                    return None
+
+            # 宽高和位置一起还原；老配置只有 x/y，那就只挪位置
+            width, height = _read("w"), _read("h")
+            if width and height:
+                self.resize(
+                    max(width, self.minimumWidth()), max(height, self.minimumHeight())
+                )
+            x, y = _read("x"), _read("y")
+            if x is not None and y is not None:
+                self.move(x, y)
+            self._clamp_to_screen()
+        self._geo_ready = True
+
+    def _clamp_to_screen(self) -> None:
+        """上次的位置/尺寸可能落在已经拔掉的显示器上，收回到有画面的区域里。"""
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        width = min(self.width(), max(self.minimumWidth(), area.width()))
+        height = min(self.height(), max(self.minimumHeight(), area.height()))
+        self.resize(width, height)
+        x = min(max(self.x(), area.left()), area.right() - width + 1)
+        y = min(max(self.y(), area.top()), area.bottom() - height + 1)
+        self.move(x, y)
+
+    def _store_geometry(self) -> None:
+        self.cfg["window"] = {
+            "x": self.x(),
+            "y": self.y(),
+            "w": self.width(),
+            "h": self.height(),
+        }
+        self._save_config_quiet()
+
+    def _queue_geometry_save(self) -> None:
+        # 启动时的 resize 事件不能盖掉刚读出来的旧尺寸，等还原完再开始记
+        if self._geo_ready and self._geo_timer is not None:
+            self._geo_timer.start()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._queue_geometry_save()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._queue_geometry_save()
 
     def _toggle_topmost(self) -> None:
         on = self.pin_btn.isChecked()
@@ -3152,7 +3212,12 @@ class FloatingWindow(QWidget):
         if self._emoticon_panel is not None:
             self._emoticon_panel.close()
         self.cfg["split"] = self._layout_sizes()
-        self.cfg["window"] = {"x": self.x(), "y": self.y()}
+        self.cfg["window"] = {
+            "x": self.x(),
+            "y": self.y(),
+            "w": self.width(),
+            "h": self.height(),
+        }
         try:
             save_gui_config(self.config_path, self.cfg)
         except OSError:
