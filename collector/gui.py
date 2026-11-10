@@ -276,6 +276,19 @@ QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
 QPushButton#ghost { background: transparent; border: none; color: #9aa3b2; padding: 4px 8px; }
 QPushButton#ghost:hover { color: #ffffff; }
+QPushButton:disabled {
+    color: #5d6878;
+    background: rgba(255, 255, 255, 8);
+    border-color: rgba(255, 255, 255, 14);
+}
+QPushButton#primary:disabled { background: #2b3240; color: #7d8797; }
+QPushButton#ghost:disabled { background: transparent; color: #4f5764; }
+QLineEdit:disabled, QComboBox:disabled {
+    color: #5d6878;
+    background: rgba(255, 255, 255, 8);
+    border-color: rgba(255, 255, 255, 14);
+}
+QComboBox QLineEdit:disabled { color: #5d6878; background: transparent; border: none; }
 QCheckBox { color: #c3c8d1; font-size: 11px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #3a414d; border-radius: 4px; min-height: 24px; }
@@ -360,6 +373,19 @@ QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #c0392b; }
 QPushButton#ghost { background: transparent; border: none; color: #6b7280; padding: 4px 8px; }
 QPushButton#ghost:hover { color: #111827; background: #eef1f5; border-radius: 6px; }
+QPushButton:disabled {
+    color: #a8b0bd;
+    background: #f5f7fa;
+    border-color: #e5e9ef;
+}
+QPushButton#primary:disabled { background: #b9cdf3; color: #ffffff; }
+QPushButton#ghost:disabled { background: transparent; color: #b3bac6; }
+QLineEdit:disabled, QComboBox:disabled {
+    color: #a8b0bd;
+    background: #f7f9fb;
+    border-color: #e5e9ef;
+}
+QComboBox QLineEdit:disabled { color: #a8b0bd; background: transparent; border: none; }
 QCheckBox { color: #374151; font-size: 11px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #c7ced8; border-radius: 4px; min-height: 24px; }
@@ -684,7 +710,7 @@ class FloatingWindow(QWidget):
         self.sender = DanmakuSender(self.cfg)
         self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
         self._send_future: Future | None = None
-        self._send_offline = False
+        self._mode_locked = False  # 房间只开放一种位置时下拉锁死
         self.send_color = int(self.cfg.get("send_color", DEFAULT_COLOR)) & 0xFFFFFF
         # 表情面板单独一份图（要更大的尺寸），磁盘缓存和弹幕列表共用
         self._emote_images = ImageLoader(
@@ -781,6 +807,10 @@ class FloatingWindow(QWidget):
         if clear:
             for view in (self.danmaku, self.event_view, self.sc_view):
                 view.clear()
+
+        # 换主题会把箭头颜色改回「可用」色，这里按连接状态重新压一压
+        if hasattr(self, "send_btn"):
+            self._refresh_send_state()
 
     def _on_system_theme_changed(self, scheme) -> None:
         if str(self.cfg.get("theme", "dark")) != "system":
@@ -1103,7 +1133,8 @@ class FloatingWindow(QWidget):
             self.mode_box.setCurrentIndex(index if index >= 0 else 0)
             self.mode_box.blockSignals(False)
             only_one = len(modes) == 1
-            self.mode_box.setEnabled(not only_one)
+            self._mode_locked = only_one
+            self.mode_box.setEnabled(not only_one and bool(self.state.real_room))
             self.mode_box.setToolTip(
                 f"该房间只开放「{modes[0]['name']}」" if only_one else "弹幕位置"
             )
@@ -1199,6 +1230,8 @@ class FloatingWindow(QWidget):
             pass
 
     def _send_hint(self) -> str:
+        if not self.state.real_room:
+            return "先连接直播间才能发弹幕（避免发错房间）"
         if not self.sender.has_login:
             return "未配置 cookie（config.json 的 cookie_file），只能收不能发"
         who = f"以 {self.sender.uname} 的身份发送" if self.sender.uname else "用 cookie 对应的账号发送"
@@ -1212,14 +1245,39 @@ class FloatingWindow(QWidget):
         self._emote_packages = []
         self._emote_message = ""
         self._send_options = None
+        self._mode_locked = False
+        self._refresh_send_state()
         self.send_btn.setToolTip(self._send_hint())
 
     def _send_room(self) -> int:
-        """发送目标：优先用已连上的真实房间号，否则用输入框里填的。"""
-        if self.state.real_room:
-            return self.state.real_room
-        raw = self.room_input.currentText().strip()
-        return int(raw) if raw.isdigit() else 0
+        """发送目标：只认已经连上的真实房间号。
+
+        以前没连接时拿输入框里填的数字当目标，等于让界面自己猜发到哪：
+        少按一位就可能发进别人房间，陌生房间的发言还容易触发风控。
+        现在必须真正连进某个房间才允许发送。
+        """
+        return self.state.real_room
+
+    def _refresh_send_state(self) -> None:
+        """按「是否已连上房间」开关整条发送行。"""
+        ready = bool(self.state.real_room)
+        busy = self._send_future is not None
+        self.send_input.setPlaceholderText(
+            f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）"
+            if ready
+            else "先连接直播间，才能发弹幕"
+        )
+        for widget in (self.send_input, self.emote_btn, self.color_btn):
+            widget.setEnabled(ready)
+        self.mode_box.setEnabled(ready and not self._mode_locked)
+        self.send_btn.setEnabled(ready and not busy)
+        self.mode_arrow.setStyleSheet(
+            f"color:{self._c['arrow'] if ready else self._c['split']};"
+            " background:transparent; font-size:11px;"
+        )
+        hint = self._send_hint()
+        self.send_btn.setToolTip(hint)
+        self.send_input.setToolTip(hint)
 
     def _on_send(self) -> None:
         text = self.send_input.text().strip()
@@ -1231,12 +1289,10 @@ class FloatingWindow(QWidget):
             return
         room = self._send_room()
         if not room:
-            self._append_sys("发送失败：还没连上直播间，先点「连接」或填个房间号")
+            self._append_sys("发送失败：还没有连上任何直播间，发送行已锁住")
             return
         self.send_btn.setEnabled(False)
         self.send_btn.setText("发送中…")
-        # 没连采集时看不到服务端回显，成功后就自己提示一句
-        self._send_offline = not self.state.real_room
         self._send_future = self._send_pool.submit(
             self._send_worker, room, msg, self.send_color, self._send_mode(), dm_type,
             display or msg,
@@ -1267,15 +1323,13 @@ class FloatingWindow(QWidget):
         except Exception as exc:  # noqa: BLE001 - worker 之外的意外，也要回到可发送状态
             ok, payload = False, f"{type(exc).__name__}: {exc}"
 
-        self.send_btn.setEnabled(True)
         self.send_btn.setText("发送")
-        self.send_btn.setToolTip(self._send_hint())
+        # 恢复可用性：是否连上、是否还在发，都以真实状态为准
+        self._refresh_send_state()
         if ok:
             # 只有内容没被改过才清空，避免把用户新打的字冲掉
             if self.send_input.text().strip() == payload:
                 self.send_input.clear()
-            if self._send_offline:
-                self._append_sys(f"已发送（未连采集，看不到回显）：{payload}")
             self.send_btn.setText("已发送")
             QTimer.singleShot(1200, lambda: self.send_btn.setText("发送"))
         else:
@@ -1726,6 +1780,9 @@ class FloatingWindow(QWidget):
     def _disconnect(self) -> None:
         self.connect_btn.setEnabled(False)
         self.connect_btn.setText("停止中")
+        # 一按断开就锁住发送行，别让停止的这几秒里还能往旧房间发
+        self.state.real_room = 0
+        self._refresh_send_state()
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
     def _stop_worker(self) -> None:
@@ -1929,6 +1986,7 @@ class FloatingWindow(QWidget):
         self.connect_btn.style().polish(self.connect_btn)
         self.connect_btn.setEnabled(True)
         self.room_input.setEnabled(not running)
+        self._refresh_send_state()
 
     # ----- event pump -----
 
@@ -1964,6 +2022,7 @@ class FloatingWindow(QWidget):
                 self.state.title = event.get("title") or ""
                 self.title_label.setText(self.state.title or TITLE)
                 self._append_sys(f"已进入 {self.state.real_room} · {self.state.title}")
+                self._refresh_send_state()
             elif kind == "sys":
                 self._append_sys(str(event.get("text") or ""))
             elif kind == "status":
@@ -2019,6 +2078,8 @@ class FloatingWindow(QWidget):
                 self._append_sys(f"采集异常：{event.get('error')}")
                 self._set_connected_ui(False)
             elif kind == "ui_stopped":
+                # 断开后必须把房间号清掉，否则发送行会以为还连着，能发到上一个房间
+                self.state.real_room = 0
                 self._set_connected_ui(False)
                 self.dot.setObjectName("dead")
                 self._append_sys("已断开")
