@@ -15,7 +15,7 @@ from datetime import datetime
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPixmap,
+    QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPixmap,
     QTextBlockUserData, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -54,7 +54,18 @@ AVATAR_PX = 18
 # 表情面板：按钮尺寸、每行几个、面板宽高
 EMOTICON_BTN = 40
 EMOTICON_COLS = 8
-EMOTICON_PANEL_W = 344
+EMOTICON_GAP = 2   # 格子间距
+EMOTICON_PAD = 2   # 网格容器内边距
+EMOTICON_BAR = 10  # 竖向滚动条占位（QSS 里 8px 宽 + 1px 边距）
+# 宽度必须按内容算：写死一个数，最右一列就会被裁掉半截
+EMOTICON_PANEL_W = (
+    8 + 8                                    # root 左右内边距
+    + EMOTICON_PAD * 2                       # 网格容器内边距
+    + EMOTICON_COLS * EMOTICON_BTN
+    + (EMOTICON_COLS - 1) * EMOTICON_GAP
+    + EMOTICON_BAR
+    + 2                                      # 取整余量
+)
 EMOTICON_PANEL_H = 268
 
 
@@ -450,6 +461,9 @@ THEME_COLORS = {
         "sep": "#5d6878",
         "price": "#f0a020",
         "price_hi": "#ff7b3d",
+        # 自己发的弹幕：整行底色 + 左侧竖条
+        "self_bg": "#243247",
+        "self_mark": "#5c9dff",
         "split": "#2a2f38",
         "arrow": "#b6bdc9",
         "grip": "#5b6472",
@@ -476,6 +490,9 @@ THEME_COLORS = {
         "sep": "#c7ced8",
         "price": "#b45309",
         "price_hi": "#c2410c",
+        # 自己发的弹幕：整行底色 + 左侧竖条
+        "self_bg": "#e2ecfd",
+        "self_mark": "#1a73e8",
         "split": "#e5e7eb",
         "arrow": "#6b7280",
         "grip": "#9aa3b2",
@@ -550,8 +567,10 @@ class EmoticonPanel(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._body = QWidget()
         self._grid = QGridLayout(self._body)
-        self._grid.setContentsMargins(2, 2, 2, 2)
-        self._grid.setSpacing(2)
+        self._grid.setContentsMargins(
+            EMOTICON_PAD, EMOTICON_PAD, EMOTICON_PAD, EMOTICON_PAD
+        )
+        self._grid.setSpacing(EMOTICON_GAP)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._scroll.setWidget(self._body)
         root.addWidget(self._scroll, 1)
@@ -816,6 +835,8 @@ class FloatingWindow(QWidget):
         self._pane_sizes: dict[str, int] = {}
         self._mock_thread: threading.Thread | None = None
         self._mock_stop: threading.Event | None = None
+        # 0 号直播间：本地回放 + 本地回显发送，用来调试发送行
+        self._test_mode = False
 
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
@@ -1147,7 +1168,7 @@ class FloatingWindow(QWidget):
 
     def _use_account(self, account) -> None:
         """换成这个账号：重建发送器，表情包、可用颜色、粉丝牌全部作废重拉。"""
-        was_connected = bool(self.state.real_room)
+        was_connected = self._room_ready()
         self.sender = DanmakuSender(self.cfg, account)
         self._sender_path = account.path if account is not None else ""
         self._emote_room = 0
@@ -1158,7 +1179,7 @@ class FloatingWindow(QWidget):
         self._medals = []
         self._fill_medal_box()
         self._refresh_send_state()
-        if self.state.real_room:
+        if self._room_ready():
             self._refresh_room_context(force=True)
             self._request_medals()
         self._request_account_meta()
@@ -1278,7 +1299,7 @@ class FloatingWindow(QWidget):
             self.medal_box.addItem("拉取粉丝牌…", 0)
             self.medal_box.setEnabled(False)
             self.medal_box.setToolTip("正在拉取该账号的粉丝牌")
-        elif not self.state.real_room:
+        elif not self._room_ready():
             self.medal_box.addItem("连接后可选牌子", 0)
             self.medal_box.setEnabled(False)
             self.medal_box.setToolTip("粉丝牌按账号查询，连上直播间再选")
@@ -1434,6 +1455,12 @@ class FloatingWindow(QWidget):
         self._emoticon_panel.apply_theme(self._c)
 
         self._refresh_room_context()
+        if not self._emoticon_room():
+            self._emoticon_panel.set_packages(
+                [], "没有房间配置：先连一次真实房间，表情包会记下来"
+            )
+            self._emoticon_panel.popup_at(self.emote_btn)
+            return
         self._emoticon_panel.set_packages(
             self._emote_packages, self._emote_message or "正在拉取表情…"
         )
@@ -1492,7 +1519,7 @@ class FloatingWindow(QWidget):
             self.mode_box.blockSignals(False)
             only_one = len(modes) == 1
             self._mode_locked = only_one
-            self.mode_box.setEnabled(not only_one and bool(self.state.real_room))
+            self.mode_box.setEnabled(not only_one and self._room_ready())
             self.mode_box.setToolTip(
                 f"该房间只开放「{modes[0]['name']}」" if only_one else "弹幕位置"
             )
@@ -1525,7 +1552,7 @@ class FloatingWindow(QWidget):
             self.send_input.setFocus()
             return
         # 输入框空着就是要发表情，直接发，绕开输入框的长度截断
-        self._submit_send(msg, display=text, dm_type=dm_type)
+        self._submit_send(msg, display=text, dm_type=dm_type, emote_url=str(item.get("url") or ""))
 
     def _poll_room_context(self) -> None:
         if self._context_future is None or not self._context_future.done():
@@ -1592,6 +1619,8 @@ class FloatingWindow(QWidget):
             pass
 
     def _send_hint(self) -> str:
+        if self._test_mode:
+            return "0 号直播间是本地测试：发送只在本机回显，不会发到 B 站"
         if not self.state.real_room:
             return "先连接直播间才能发弹幕（避免发错房间）"
         if not self.sender.has_login:
@@ -1621,21 +1650,31 @@ class FloatingWindow(QWidget):
             )
         self._request_account_meta()
 
+    def _room_ready(self) -> bool:
+        """已经连进真实房间，或者正在 0 号直播间做本地测试。"""
+        return bool(self.state.real_room) or self._test_mode
+
     def _send_room(self) -> int:
         """发送目标：只认已经连上的真实房间号。
 
         以前没连接时拿输入框里填的数字当目标，等于让界面自己猜发到哪：
         少按一位就可能发进别人房间，陌生房间的发言还容易触发风控。
         现在必须真正连进某个房间才允许发送。
+
+        0 号直播间不连网络，所以这里返回 0；真正的目标由 ``_submit_send``
+        按 ``_test_mode`` 分叉，测试模式下只在本地回显。
         """
         return self.state.real_room
 
     def _refresh_send_state(self) -> None:
         """按「已连上房间」和「有可用账号」两个条件开关整条发送行。"""
-        room_ready = bool(self.state.real_room)
-        ready = room_ready and self.sender.has_login
+        room_ready = self._room_ready()
+        # 测试模式不会真的发出去，没有 cookie 也允许点，方便调界面
+        ready = room_ready and (self._test_mode or self.sender.has_login)
         busy = self._send_future is not None
-        if not room_ready:
+        if self._test_mode:
+            placeholder = f"0 号直播间测试：发送只在本机回显（最多 {SEND_MAX_LEN} 字）"
+        elif not room_ready:
             placeholder = "先连接直播间，才能发弹幕"
         elif not self.sender.has_login:
             placeholder = "账号目录里没有可用账号"
@@ -1659,8 +1698,14 @@ class FloatingWindow(QWidget):
         if text:
             self._submit_send(text)
 
-    def _submit_send(self, msg: str, *, display: str = "", dm_type: int = 0) -> None:
+    def _submit_send(
+        self, msg: str, *, display: str = "", dm_type: int = 0, emote_url: str = ""
+    ) -> None:
         if self._send_future is not None:
+            return
+        if self._test_mode:
+            # 测试模式：一步都不出网，直接在弹幕流里回显，方便核对颜色/位置/表情
+            self._echo_local(msg, display or msg, dm_type, emote_url)
             return
         room = self._send_room()
         if not room:
@@ -1672,6 +1717,44 @@ class FloatingWindow(QWidget):
             self._send_worker, room, msg, self.send_color, self._send_mode(), dm_type,
             display or msg, self._selected_medal(),
         )
+
+    def _echo_local(self, msg: str, display: str, dm_type: int, emote_url: str) -> None:
+        """测试模式下把自己「发」的弹幕补进列表，标记成本人 + 测试。"""
+        row = {
+            "event_time": int(time.time()),
+            "uname": self.sender.uname or "我",
+            "uid": int(self.sender.uid or 0),
+            "text": display,
+            "is_emoticon": bool(dm_type and emote_url),
+            "emote_url": emote_url if dm_type else "",
+            "is_admin": False,
+            "guard_level": 0,
+            "medal_name": "",
+            "medal_level": 0,
+            "_self": True,
+            "_test": True,
+            "_color": self.send_color,
+            "_mode": self._send_mode(),
+        }
+        # 选了牌子就把牌子也画上，测试时能看清带不带牌子
+        medal_id = self._selected_medal()
+        if medal_id:
+            for medal in self._medals:
+                if int(medal.get("medal_id") or 0) == medal_id:
+                    row["medal_name"] = medal.get("name") or ""
+                    row["medal_level"] = int(medal.get("level") or 0)
+                    break
+        self.state.messages += 1
+        self.danmaku_title.setText(f"弹幕 {self.state.messages}")
+        for url in self._row_image_urls(row):
+            self._images.want(url)
+        self._insert_danmaku([row])
+
+        if self.send_input.text().strip() == msg:
+            self.send_input.clear()
+        self.send_btn.setText("已发送")
+        QTimer.singleShot(1200, lambda: self.send_btn.setText("发送"))
+        self._append_sys(f"测试发送（未出网）：{display}")
 
     def _send_worker(
         self,
@@ -1825,7 +1908,9 @@ class FloatingWindow(QWidget):
         self.room_input = QComboBox()
         self.room_input.setEditable(True)
         self.room_input.setFixedWidth(148)
-        self.room_input.setToolTip("可直接输入房间号；下拉列表可右键删除历史记录")
+        self.room_input.setToolTip(
+            "可直接输入房间号；下拉列表可右键删除历史记录。填 0 是本地测试（回放 + 试发）"
+        )
         self.room_input.lineEdit().setPlaceholderText("房间号")
         self.room_input.lineEdit().returnPressed.connect(self._toggle_connect)
         self.room_input.view().viewport().installEventFilter(self)
@@ -2154,6 +2239,8 @@ class FloatingWindow(QWidget):
             QMessageBox.warning(self, TITLE, "请输入数字房间号")
             return
         room = int(raw)
+        # 0 号直播间是本地回放 + 本地回显，用来调试发送行
+        self._test_mode = room == 0
         self.state = RoomState(input_room=room, state="连接中")
         self.danmaku.clear()
         self.sc_view.clear()
@@ -2182,6 +2269,7 @@ class FloatingWindow(QWidget):
         self.connect_btn.setText("停止中")
         # 一按断开就锁住发送行，别让停止的这几秒里还能往旧房间发
         self.state.real_room = 0
+        self._test_mode = False
         self._refresh_send_state()
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
@@ -2207,6 +2295,10 @@ class FloatingWindow(QWidget):
         self.dot.style().polish(self.dot)
         self.title_label.setText("0 号直播间 · 正在载入回放")
         self._append_sys("0 号直播间：读取采集库里的真实记录，点「断开」停止")
+        self._append_sys(
+            "测试模式：这里发出的弹幕只在本机回显，不会发到 B 站，"
+            "可用来核对颜色、位置和表情"
+        )
 
     def _mock_worker(self, stop: threading.Event) -> None:
         """0 号直播间优先回放真实原始 JSON，取不到数据再退回合成流。"""
@@ -2422,21 +2514,27 @@ class FloatingWindow(QWidget):
                 if "guards" in event:
                     self.state.guards = int(event.get("guards") or 0)
             elif kind == "room":
-                self.state.real_room = int(event.get("room_id") or 0)
+                room_no = int(event.get("room_id") or 0)
+                self.state.real_room = room_no
                 self.state.title = event.get("title") or ""
-                self.title_label.setText(self.state.title or TITLE)
-                self._append_sys(f"已进入 {self.state.real_room} · {self.state.title}")
-                if self.sender.has_login:
-                    who = self.sender.uname or "账号"
-                    if self.sender.uname:
-                        self._append_sys(f"采集身份：{self.sender.uname}")
-                    self.dot.setToolTip(f"以 {who} 的身份采集")
-                else:
-                    self._append_sys(
-                        "匿名连接：部分房间会把用户名显示成 ***，"
-                        "在账号目录里放 cookie、选上账号后重连即可"
-                    )
-                    self.dot.setToolTip("匿名连接：部分房间的用户名会显示为 ***")
+                self.title_label.setText(
+                    self.state.title or TITLE
+                    if room_no
+                    else f"0 号直播间 · {self.state.title or '本地测试'}"
+                )
+                if room_no:
+                    self._append_sys(f"已进入 {room_no} · {self.state.title}")
+                    if self.sender.has_login:
+                        who = self.sender.uname or "账号"
+                        if self.sender.uname:
+                            self._append_sys(f"采集身份：{self.sender.uname}")
+                        self.dot.setToolTip(f"以 {who} 的身份采集")
+                    else:
+                        self._append_sys(
+                            "匿名连接：部分房间会把用户名显示成 ***，"
+                            "在账号目录里放 cookie、选上账号后重连即可"
+                        )
+                        self.dot.setToolTip("匿名连接：部分房间的用户名会显示为 ***")
                 self._refresh_send_state()
                 self._request_medals()
             elif kind == "sys":
@@ -2496,6 +2594,7 @@ class FloatingWindow(QWidget):
             elif kind == "ui_stopped":
                 # 断开后必须把房间号清掉，否则发送行会以为还连着，能发到上一个房间
                 self.state.real_room = 0
+                self._test_mode = False
                 self._set_connected_ui(False)
                 self.dot.setObjectName("dead")
                 self._append_sys("已断开")
@@ -2573,6 +2672,7 @@ class FloatingWindow(QWidget):
             if cursor.position() > 0:
                 cursor.insertBlock()
             cursor.insertHtml(self._danmaku_html(row))
+            self._highlight_self_block(cursor, row)
 
             pending = [url for url in urls if not self._images.settled(url)]
             if pending:
@@ -2630,6 +2730,7 @@ class FloatingWindow(QWidget):
         cursor.beginEditBlock()
         cursor.removeSelectedText()
         cursor.insertHtml(self._danmaku_html(row))
+        self._highlight_self_block(cursor, row)
         cursor.endEditBlock()
 
         if at_bottom:
@@ -2643,6 +2744,27 @@ class FloatingWindow(QWidget):
         width = max(1, round(height * image.width() / image.height()))
         return width, height
 
+    def _is_self_row(self, row: dict) -> bool:
+        """这一行是不是自己发的：优先看标记，其次按 uid 认。"""
+        if row.get("_self"):
+            return True
+        uid = int(row.get("uid") or 0)
+        mine = int(getattr(self.sender, "uid", 0) or 0)
+        return bool(uid) and uid == mine
+
+    def _highlight_self_block(self, cursor: QTextCursor, row: dict) -> None:
+        """整行铺一层底色，比只改文字颜色更容易一眼扫到。
+
+        非本人的行必须显式清掉底色：插入新块会继承上一块的格式，
+        自己的那行后面要是跟着一条别人的弹幕，别人也会被染上。
+        """
+        fmt = cursor.blockFormat()
+        if self._is_self_row(row):
+            fmt.setBackground(QBrush(QColor(self._c["self_bg"])))
+        else:
+            fmt.clearBackground()
+        cursor.setBlockFormat(fmt)
+
     def _danmaku_html(self, row: dict) -> str:
         event_time = row.get("event_time") or 0
         stamp = (
@@ -2651,6 +2773,8 @@ class FloatingWindow(QWidget):
             else datetime.now().strftime("%H:%M:%S")
         )
         parts = [f'<span style="color:{self._c["time"]}">{stamp}</span>']
+        if self._is_self_row(row):
+            parts.insert(0, f'<span style="color:{self._c["self_mark"]}">▌</span>')
 
         medal = row.get("medal_name") or ""
         if medal:
@@ -2690,6 +2814,13 @@ class FloatingWindow(QWidget):
                 parts.append(f'<span style="color:{self._c["emoticon"]}">[{text}]</span>')
         else:
             parts.append(f'<span style="color:{self._c["text"]}">{text}</span>')
+        if row.get("_test"):
+            # 测试模式的回显带上这次发送用的颜色和位置，方便对照
+            mode = dict(MODES).get(int(row.get("_mode") or 1), "滚动")
+            color = int(row.get("_color") or 0)
+            parts.append(
+                f'<span style="color:{self._c["time"]}">[测试 #{color:06x} · {mode}]</span>'
+            )
         return " ".join(parts)
 
     def _open_profile(self, url: QUrl) -> None:
@@ -2706,6 +2837,10 @@ class FloatingWindow(QWidget):
         if cursor.position() > 0:
             cursor.insertText("\n")
         cursor.insertText(f"— {text}", self._fmt_sys)
+        # 系统行不跟着上一条弹幕的底色走
+        fmt = cursor.blockFormat()
+        fmt.clearBackground()
+        cursor.setBlockFormat(fmt)
         cursor.endEditBlock()
         if at_bottom:
             scrollbar.setValue(scrollbar.maximum())
