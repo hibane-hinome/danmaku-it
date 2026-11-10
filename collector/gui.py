@@ -33,7 +33,7 @@ from .fixtures import JPN_AFTER, JPN_BEFORE, load_replay
 from .images import ImageLoader
 from .sender import COLOR_PRESETS, MAX_LEN as SEND_MAX_LEN
 from .sender import DEFAULT_COLOR, MODES, DanmakuSender, SendError
-from .storage import Storage, export_csv, export_ndjson, extract_sc
+from .storage import Storage, extract_sc
 
 TITLE = "弹幕机 · danmaku-it"
 # 图标由 tools/make_icon.py 生成，改图案后重跑那个脚本即可
@@ -291,6 +291,12 @@ QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
 QPushButton#ghost { background: transparent; border: none; color: #9aa3b2; padding: 4px 8px; }
 QPushButton#ghost:hover { color: #ffffff; }
+QPushButton#ghost:checked {
+    background: rgba(47, 111, 237, 58);
+    color: #a9c8ff;
+    border: 1px solid rgba(94, 148, 255, 96);
+}
+QPushButton#ghost:checked:hover { background: rgba(47, 111, 237, 84); }
 QPushButton:disabled {
     color: #5d6878;
     background: rgba(255, 255, 255, 8);
@@ -388,6 +394,14 @@ QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #c0392b; }
 QPushButton#ghost { background: transparent; border: none; color: #6b7280; padding: 4px 8px; }
 QPushButton#ghost:hover { color: #111827; background: #eef1f5; border-radius: 6px; }
+QPushButton#ghost:checked {
+    background: #dfe9ff;
+    color: #2f6fed;
+    border: 1px solid #b9cdf3;
+    border-radius: 6px;
+    font-weight: 600;
+}
+QPushButton#ghost:checked:hover { background: #d2e0ff; }
 QPushButton:disabled {
     color: #a8b0bd;
     background: #f5f7fa;
@@ -876,6 +890,8 @@ class FloatingWindow(QWidget):
 
         root.addLayout(self._build_header())
         root.addLayout(self._build_control_row())
+        # 账号和粉丝牌放在列表上方：先定「谁在发」，再看内容
+        root.addLayout(self._build_identity_row())
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -920,7 +936,6 @@ class FloatingWindow(QWidget):
         splitter.setSizes([340, 170, 150])
         root.addWidget(splitter, 1)
 
-        root.addLayout(self._build_identity_row())
         root.addLayout(self._build_send_row())
 
         grip_row = QHBoxLayout()
@@ -943,12 +958,15 @@ class FloatingWindow(QWidget):
         self.title_label.setObjectName("title")
         header.addWidget(self.title_label, 1)
 
-        self.pin_btn = QPushButton("置顶")
+        self.pin_btn = QPushButton()
         self.pin_btn.setObjectName("ghost")
         self.pin_btn.setCheckable(True)
         self.pin_btn.setChecked(True)
+        # 固定宽度：切换文案时按钮不应带着整行抖一下
+        self.pin_btn.setFixedWidth(58)
         self.pin_btn.clicked.connect(self._toggle_topmost)
         header.addWidget(self.pin_btn)
+        self._sync_pin_button()
 
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("ghost")
@@ -1780,11 +1798,6 @@ class FloatingWindow(QWidget):
         self.connect_btn.clicked.connect(self._toggle_connect)
         footer.addWidget(self.connect_btn)
 
-        self.export_btn = QPushButton("导出")
-        self.export_btn.setObjectName("ghost")
-        self.export_btn.clicked.connect(self._export_menu)
-        footer.addWidget(self.export_btn)
-
         self.pane_btn = QPushButton("栏目")
         self.pane_btn.setObjectName("ghost")
         menu = QMenu(self.pane_btn)
@@ -1995,6 +2008,18 @@ class FloatingWindow(QWidget):
         on = self.pin_btn.isChecked()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
         self.show()
+        self._sync_pin_button()
+
+    def _sync_pin_button(self) -> None:
+        """置顶按钮要能一眼看出状态：文案 + 高亮底（见 QSS 的 :checked）。"""
+        pinned = self.pin_btn.isChecked()
+        self.pin_btn.setText("已置顶" if pinned else "置顶")
+        self.pin_btn.setToolTip(
+            "当前窗口固定在所有窗口之上，点击取消" if pinned
+            else "点击把窗口固定在最前面，不被其他窗口盖住"
+        )
+        self.pin_btn.style().unpolish(self.pin_btn)
+        self.pin_btn.style().polish(self.pin_btn)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and event.position().y() < 60:
@@ -2735,7 +2760,7 @@ class FloatingWindow(QWidget):
                 return
             block = block.next()
 
-    # ----- settings / export -----
+    # ----- settings -----
 
     def _open_settings(self) -> None:
         # 再点一次就收起（popup 按钮的常见手感），不必先点别处
@@ -2747,26 +2772,6 @@ class FloatingWindow(QWidget):
         self._settings = SettingsPopup(self)
         self._settings.adjustSize()
         self._settings.popup_at(self.settings_btn)
-
-    def _export_menu(self) -> None:
-        path, selected = QFileDialog.getSaveFileName(
-            self, "导出", f"sc_{datetime.now():%Y%m%d_%H%M%S}.ndjson",
-            "NDJSON (*.ndjson);;CSV (*.csv)",
-        )
-        if not path:
-            return
-        try:
-            storage = Storage(self.cfg["database"])
-            try:
-                if path.lower().endswith(".csv") or "CSV" in selected:
-                    count = export_csv(storage.iter_rows(), path)
-                else:
-                    count = export_ndjson(storage.iter_rows(with_raw=True), path, with_raw=True)
-            finally:
-                storage.close()
-            self._append_sys(f"已导出 {count} 条 → {path}")
-        except Exception as exc:  # noqa: BLE001 - report to user
-            QMessageBox.critical(self, "导出失败", str(exc))
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2929,10 +2934,6 @@ class SettingsPopup(QDialog):
         self.cookie_dir.setPlaceholderText("放 cookie 文件的目录，可以放多个 csv，启动时自动扫描")
         form.addRow("账号目录", self._with_dir_browse(self.cookie_dir))
 
-        self.topmost = QCheckBox("窗口置顶")
-        self.topmost.setChecked(owner.pin_btn.isChecked())
-        form.addRow("", self.topmost)
-
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("取消")
@@ -3065,9 +3066,6 @@ class SettingsPopup(QDialog):
         owner._reload_sender()
         owner._apply_theme(resolve_theme(theme))
         save_gui_config(owner.config_path, owner.cfg)
-        if self.topmost.isChecked() != owner.pin_btn.isChecked():
-            owner.pin_btn.setChecked(self.topmost.isChecked())
-            owner._toggle_topmost()
         owner._append_sys("设置已保存" + ("，连接中修改数据库/日志需重连生效" if owner.service.running else ""))
         self.accept()
 
