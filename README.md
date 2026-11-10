@@ -29,23 +29,31 @@ cd D:\HibaneHinome\danmaku-it
 
 ## 配置
 
-`config.json`：
+`config.json` **不入库**（含 cookie 路径与本机窗口状态），首次使用从模板复制：
+
+```bash
+cp config.example.json config.json
+```
+
+模板里 `database` 用相对路径指向同一工作区的归档库，`rooms` 换成要采集的直播间：
 
 ```json
 {
-  "rooms": [545068, 21452505],
-  "database": "data/sc.db",
+  "rooms": [22748536],
+  "database": "../live-archive/.data/translation_history.db",
   "log_file": "logs/collector.log",
+  "cookie_file": "",
   "log_level": "INFO",
-  "heartbeat_seconds": 30,
-  "stale_timeout_seconds": 120,
-  "backoff_base_seconds": 1.0,
-  "backoff_max_seconds": 60.0,
-  "stats_interval_seconds": 60
+  "heartbeat_seconds": 30
 }
 ```
 
-相对路径基于 `config.json` 所在目录解析。`rooms` 可填短号或真实房间号，程序会自己用 `getInfoByRoom` 解析成真实 `room_id`。
+- `rooms` 可填短号或真实房间号，程序会用 `getInfoByRoom` 解析成真实 `room_id`；填 `0` 进入离线回放，从库里读真实 payload 走同一套解析，不联网也不写库。
+- `database` 与 `log_file` 的相对路径基于 `config.json` 所在目录解析，也可写绝对路径。
+- `cookie_file` 支持浏览器导出的 Netscape 格式 cookie（**用绝对路径**，代码不会帮你解析相对路径）。留空即匿名采集——公开直播间的弹幕不需要登录。
+- `sessdata` / `dede_user_id` 可选，同样只留在本机。
+
+表结构由 `collector/storage.py` 在首次写入时自动创建，指向一个空文件也能直接用。
 
 ## 启动
 
