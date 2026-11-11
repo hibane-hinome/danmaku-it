@@ -324,6 +324,27 @@ QPushButton:hover { background: rgba(255, 255, 255, 32); }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
+/* 发送按钮右侧的「▾」：跟发送同一个底色，拼成一个按钮，只多一条竖线 */
+QPushButton#primary[joined="left"] {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+QPushButton#sendmore {
+    background: #2f6fed;
+    border: none;
+    border-left: 1px solid rgba(255, 255, 255, 78);
+    color: white;
+    padding: 0 3px;
+    font-size: 10px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+QPushButton#sendmore:hover { background: #3b7bf5; }
+QPushButton#sendmore:disabled {
+    background: #2b3240;
+    color: #7d8797;
+    border-left-color: rgba(255, 255, 255, 22);
+}
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -433,6 +454,26 @@ QPushButton:pressed { background: #e6ebf2; }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #c0392b; }
+QPushButton#primary[joined="left"] {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+QPushButton#sendmore {
+    background: #2f6fed;
+    border: none;
+    border-left: 1px solid rgba(255, 255, 255, 150);
+    color: white;
+    padding: 0 3px;
+    font-size: 10px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+QPushButton#sendmore:hover { background: #3b7bf5; }
+QPushButton#sendmore:disabled {
+    background: #b9cdf3;
+    color: #ffffff;
+    border-left-color: rgba(255, 255, 255, 190);
+}
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -856,7 +897,9 @@ class FloatingWindow(QWidget):
         self._sender_path = preferred.path if preferred is not None else ""
         self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
         self._send_future: Future | None = None
-        self._mode_locked = False  # 房间只开放一种位置时下拉锁死
+        self._mode_locked = False  # 房间只开放一种位置时锁死选择
+        # 位置以前挂在下拉的 currentData 上，现在收进发送按钮的下拉，值自己存
+        self._send_mode_value = int(self.cfg.get("send_mode", 1))
         self.send_color = int(self.cfg.get("send_color", DEFAULT_COLOR)) & 0xFFFFFF
         # 表情面板单独一份图（要更大的尺寸），磁盘缓存和弹幕列表共用
         self._emote_images = ImageLoader(
@@ -954,7 +997,6 @@ class FloatingWindow(QWidget):
             getattr(self, "room_arrow", None),
             getattr(self, "account_arrow", None),
             getattr(self, "medal_arrow", None),
-            getattr(self, "mode_arrow", None),
         ):
             if arrow is not None:
                 arrow.setStyleSheet(
@@ -1213,30 +1255,23 @@ class FloatingWindow(QWidget):
         self.emote_btn.clicked.connect(self._open_emoticons)
         row.addWidget(self.emote_btn)
 
-        self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(26, 26)
-        self.color_btn.setToolTip("弹幕颜色")
-        self.color_btn.clicked.connect(self._open_color_menu)
-        row.addWidget(self.color_btn)
-        self._paint_color_btn()
-
-        self.mode_box = QComboBox()
-        self.mode_box.setFixedWidth(62)
-        self.mode_box.setToolTip("弹幕位置")
-        for mode, label in MODES:
-            self.mode_box.addItem(label, mode)
-        index = self.mode_box.findData(int(self.cfg.get("send_mode", 1)))
-        self.mode_box.setCurrentIndex(index if index >= 0 else 0)
-        self.mode_box.currentIndexChanged.connect(self._on_send_mode_changed)
-        row.addWidget(self.mode_box)
-        self.mode_arrow = self._combo_arrow(self.mode_box)
-
+        # 发送和它右边的「▾」拼成一个按钮：颜色、位置都收进这个下拉，
+        # 窄窗口下能省出原来色块 + 位置下拉占的两格
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
+        self.send_btn.setProperty("joined", "left")
         self.send_btn.setProperty("active", "false")
         self.send_btn.clicked.connect(self._on_send)
         self.send_btn.setToolTip(self._send_hint())
         row.addWidget(self.send_btn)
+
+        self.send_more = QPushButton("▾")
+        self.send_more.setObjectName("sendmore")
+        self.send_more.setFixedWidth(18)
+        self.send_more.setCursor(Qt.PointingHandCursor)
+        self.send_more.setToolTip("弹幕颜色与位置")
+        self.send_more.clicked.connect(self._open_send_options)
+        row.addWidget(self.send_more)
         return row
 
     # ----- 账号 -----
@@ -1522,34 +1557,28 @@ class FloatingWindow(QWidget):
             return 0
         return int(self.medal_box.currentData() or 0)
 
-    # ----- 发送选项：位置 / 颜色 -----
+    # ----- 发送选项：颜色 / 位置（都收在发送按钮的「▾」里） -----
 
     def _send_mode(self) -> int:
-        return int(self.mode_box.currentData() or 1)
+        return int(self._send_mode_value)
 
-    def _on_send_mode_changed(self) -> None:
-        self.cfg["send_mode"] = self._send_mode()
+    def _set_send_mode(self, mode: int, menu: QMenu | None = None) -> None:
+        self._send_mode_value = int(mode)
+        self.cfg["send_mode"] = self._send_mode_value
         self._save_config_quiet()
+        self._sync_send_hint()
+        if menu is not None:
+            menu.close()
 
-    def _paint_color_btn(self) -> None:
-        pixmap = QPixmap(16, 16)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(f"#{self.send_color:06x}"))
-        # 白块在浅色主题、黑块在暗色主题都会糊掉，统一描一圈灰边
-        painter.setPen(QColor("#8a93a3"))
-        painter.drawRoundedRect(1, 1, 14, 14, 3, 3)
-        painter.end()
-        self.color_btn.setIcon(QIcon(pixmap))
-        self.color_btn.setToolTip(f"弹幕颜色 #{self.send_color:06x}")
-
-    def _set_send_color(self, value: int, save: bool = True) -> None:
-        self.send_color = int(value) & 0xFFFFFF
-        self._paint_color_btn()
-        if save:
-            self.cfg["send_color"] = self.send_color
-            self._save_config_quiet()
+    def _mode_choices(self) -> list[tuple[str, int]]:
+        """这个房间允许的位置；没取到配置就用内置三档。"""
+        options = self._send_options or {}
+        modes = [
+            (str(item.get("name") or item["mode"]), int(item["mode"]))
+            for item in options.get("modes") or []
+            if item.get("status")
+        ]
+        return modes or [(label, mode) for mode, label in MODES]
 
     def _color_choices(self) -> list[tuple[str, int]]:
         """本房间这个账号能用的颜色；拿不到配置就退回内置色板。"""
@@ -1561,46 +1590,175 @@ class FloatingWindow(QWidget):
         ]
         return colors or list(COLOR_PRESETS)
 
-    def _open_color_menu(self) -> None:
+    def _set_send_color(self, value: int, save: bool = True, menu: QMenu | None = None) -> None:
+        self.send_color = int(value) & 0xFFFFFF
+        self._sync_send_hint()
+        if save:
+            self.cfg["send_color"] = self.send_color
+            self._save_config_quiet()
+        if menu is not None:
+            menu.close()
+
+    def _sync_send_hint(self) -> None:
+        """颜色和位置都收进下拉了，至少让按钮的悬停提示能看见当前值。"""
+        mode = {m: label for label, m in self._mode_choices()}.get(self._send_mode(), "")
+        extra = f"颜色 #{self.send_color:06x}" + (f" · 位置 {mode}" if mode else "")
+        self.send_btn.setToolTip(f"{self._send_hint()}\n{extra}")
+        self.send_more.setToolTip(f"弹幕颜色与位置\n{extra}")
+
+    @staticmethod
+    def _menu_label(text: str, name: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName(name)
+        return label
+
+    @staticmethod
+    def _menu_line() -> QFrame:
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background: rgba(128, 128, 128, 72); border: none;")
+        return line
+
+    def _menu_skin(self) -> dict[str, str]:
+        """下拉面板的配色。
+
+        右键菜单一直是系统样式（跟着系统深浅色走），这张面板里自己画了
+        色块和按钮，得按窗口当前主题上色，不然暗色主题下会有一块亮底。
+        """
+        if self.theme == "dark":
+            return {
+                "menu": "#1b1f26",
+                "border": "rgba(255, 255, 255, 46)",
+                "section": "#9aa3b2",
+                "value": "#7d8797",
+                "note": "#6b7280",
+                "choice_bg": "rgba(255, 255, 255, 18)",
+                "choice_fg": "#c3c8d1",
+                "choice_border": "rgba(255, 255, 255, 30)",
+                "choice_hi": "rgba(255, 255, 255, 36)",
+                "choice_on_bg": "rgba(47, 111, 237, 88)",
+                "choice_on_fg": "#ffffff",
+                "choice_on_border": "rgba(120, 166, 255, 150)",
+            }
+        return {
+            "menu": "#ffffff",
+            "border": "#dbe0e8",
+            "section": "#4b5563",
+            "value": "#6b7280",
+            "note": "#8a93a3",
+            "choice_bg": "#eef1f6",
+            "choice_fg": "#3b4250",
+            "choice_border": "#dbe0e8",
+            "choice_hi": "#e3e9f2",
+            "choice_on_bg": "#d7e4ff",
+            "choice_on_fg": "#1d4ed8",
+            "choice_on_border": "#8fb4f8",
+        }
+
+    def _build_send_menu(self) -> QMenu:
+        """颜色 + 位置合成的一张面板，点「▾」时弹出来。"""
         menu = QMenu(self)
-        options = self._send_options or {}
-        choices = self._color_choices()
-        total = len(options.get("colors") or [])
-
-        note = QAction(f"本房间可用 {len(choices)} 种颜色", menu)
-        note.setEnabled(False)
-        if not total:
-            note.setText("未取到房间配置，先给默认色板")
-        elif len(choices) == 1:
-            note.setText("该房间只允许这一种颜色")
-        menu.addAction(note)
-        menu.addSeparator()
-
+        skin = self._menu_skin()
+        menu.setStyleSheet(
+            f"QMenu {{ background: {skin['menu']}; border: 1px solid {skin['border']};"
+            " border-radius: 8px; padding: 2px; }"
+        )
         holder = QWidget()
-        grid = QGridLayout(holder)
-        grid.setContentsMargins(8, 6, 8, 4)
+        holder.setStyleSheet(
+            f"QLabel#menuSection {{ color: {skin['section']}; font-size: 11px;"
+            " font-weight: 600; }"
+            f"QLabel#menuValue {{ color: {skin['value']}; font-size: 10px; }}"
+            f"QLabel#menuNote {{ color: {skin['note']}; font-size: 10px; }}"
+            f"QPushButton#choice {{ background: {skin['choice_bg']};"
+            f" color: {skin['choice_fg']}; border: 1px solid {skin['choice_border']};"
+            " border-radius: 6px; padding: 3px 10px; font-size: 11px; }"
+            f"QPushButton#choice:hover {{ background: {skin['choice_hi']}; }}"
+            f"QPushButton#choice:checked {{ background: {skin['choice_on_bg']};"
+            f" color: {skin['choice_on_fg']}; border-color: {skin['choice_on_border']}; }}"
+            f"QPushButton#choice:disabled {{ color: {skin['note']}; }}"
+        )
+        box = QVBoxLayout(holder)
+        box.setContentsMargins(10, 9, 10, 9)
+        box.setSpacing(7)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(self._menu_label("弹幕颜色", "menuSection"))
+        head.addStretch(1)
+        head.addWidget(self._menu_label(f"#{self.send_color:06x}", "menuValue"))
+        box.addLayout(head)
+
+        choices = self._color_choices()
+        total = len((self._send_options or {}).get("colors") or [])
+        grid = QGridLayout()
         grid.setSpacing(4)
         for i, (name, value) in enumerate(choices):
+            # 选中的那一格加一圈亮边：20px 的小块光看颜色不知道选没选
+            picked = value == self.send_color
             swatch = QPushButton()
             swatch.setFixedSize(20, 20)
             swatch.setToolTip(f"{name} #{value:06x}")
             swatch.setCursor(Qt.PointingHandCursor)
             swatch.setStyleSheet(
-                f"background:#{value:06x}; border:1px solid rgba(128,128,128,110);"
-                " border-radius:4px; padding:0;"
+                f"background:#{value:06x}; padding:0; border-radius:4px; border:2px solid "
+                + ("#ffffff" if picked else "rgba(128,128,128,110)")
             )
             swatch.clicked.connect(
-                lambda _=False, v=value: (self._set_send_color(v), menu.close())
+                lambda _=False, v=value: self._set_send_color(v, menu=menu)
             )
             grid.addWidget(swatch, i // 5, i % 5)
+        box.addLayout(grid)
+
+        if total == 1:
+            note = "该房间只允许这一种颜色"
+        elif total:
+            note = f"本房间可用 {len(choices)} 种颜色"
+        else:
+            note = "未取到房间配置，先给默认色板"
+        box.addWidget(self._menu_label(note, "menuNote"))
+
+        custom = QPushButton("自定义颜色…")
+        custom.setObjectName("ghost")
+        custom.clicked.connect(lambda _=False: self._pick_custom_color(menu))
+        box.addWidget(custom)
+
+        box.addWidget(self._menu_line())
+
+        box.addWidget(self._menu_label("弹幕位置", "menuSection"))
+        modes = QHBoxLayout()
+        modes.setSpacing(4)
+        for name, mode in self._mode_choices():
+            btn = QPushButton(name)
+            btn.setObjectName("choice")
+            btn.setCheckable(True)
+            btn.setChecked(mode == self._send_mode())
+            btn.setEnabled(not self._mode_locked)
+            btn.clicked.connect(lambda _=False, m=mode: self._set_send_mode(m, menu))
+            modes.addWidget(btn)
+        modes.addStretch(1)
+        box.addLayout(modes)
+        if self._mode_locked:
+            box.addWidget(self._menu_label("该房间只开放这一种位置", "menuNote"))
+
         action = QWidgetAction(menu)
         action.setDefaultWidget(holder)
         menu.addAction(action)
-        menu.addSeparator()
-        menu.addAction("自定义颜色…", self._pick_custom_color)
-        menu.exec(self.color_btn.mapToGlobal(QPoint(0, self.color_btn.height() + 2)))
+        menu.adjustSize()
+        return menu
 
-    def _pick_custom_color(self) -> None:
+    def _open_send_options(self) -> None:
+        menu = self._build_send_menu()
+        # 贴在「▾」正下方、右侧对齐：面板比按钮宽，往左伸才不会跑出屏幕
+        menu.exec(
+            self.send_more.mapToGlobal(
+                QPoint(self.send_more.width() - menu.width(), self.send_more.height() + 4)
+            )
+        )
+
+    def _pick_custom_color(self, menu: QMenu | None = None) -> None:
+        # 先关菜单，否则取色对话框会盖在菜单上、关掉后菜单又冒出来
+        if menu is not None:
+            menu.close()
         picked = QColorDialog.getColor(
             QColor(f"#{self.send_color:06x}"), self, "弹幕颜色"
         )
@@ -1677,31 +1835,24 @@ class FloatingWindow(QWidget):
         return packages, options, error
 
     def _apply_send_options(self) -> None:
-        """按服务端给的可用性收窄位置下拉和颜色面板。"""
+        """按服务端给的可用性收窄位置选项和颜色面板。"""
         options = self._send_options or {}
 
         modes = [item for item in options.get("modes") or [] if item.get("status")]
         if modes:
-            keep = self._send_mode()
-            self.mode_box.blockSignals(True)
-            self.mode_box.clear()
-            for item in modes:
-                self.mode_box.addItem(item["name"] or str(item["mode"]), item["mode"])
-            index = self.mode_box.findData(keep)
-            self.mode_box.setCurrentIndex(index if index >= 0 else 0)
-            self.mode_box.blockSignals(False)
-            only_one = len(modes) == 1
-            self._mode_locked = only_one
-            self.mode_box.setEnabled(not only_one and self._room_ready())
-            self.mode_box.setToolTip(
-                f"该房间只开放「{modes[0]['name']}」" if only_one else "弹幕位置"
-            )
+            allowed = [int(item["mode"]) for item in modes]
+            # 房间换了、允许的位置跟着变：当前那个不给用就落到第一个可用的
+            if self._send_mode() not in allowed:
+                self._send_mode_value = allowed[0]
+            self._mode_locked = len(modes) == 1
             self.cfg["send_mode"] = self._send_mode()
 
         colors = [item for item in options.get("colors") or [] if item.get("status")]
         if colors and not any(item["color"] == self.send_color for item in colors):
             # 当前选的颜色房间里不给用，服务端会悄悄改白色，不如直接切成可用的
             self._set_send_color(colors[0]["color"])
+
+        self._sync_send_hint()
 
     def _on_emoticon_picked(self, item: dict) -> None:
         if self._emoticon_panel is not None:
@@ -1854,17 +2005,11 @@ class FloatingWindow(QWidget):
         else:
             placeholder = f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）"
         self.send_input.setPlaceholderText(placeholder)
-        for widget in (self.send_input, self.emote_btn, self.color_btn):
+        for widget in (self.send_input, self.emote_btn, self.send_more):
             widget.setEnabled(ready)
-        self.mode_box.setEnabled(ready and not self._mode_locked)
         self.send_btn.setEnabled(ready and not busy)
-        self.mode_arrow.setStyleSheet(
-            f"color:{self._c['arrow'] if ready else self._c['split']};"
-            " background:transparent; font-size:11px;"
-        )
-        hint = self._send_hint()
-        self.send_btn.setToolTip(hint)
-        self.send_input.setToolTip(hint)
+        self._sync_send_hint()
+        self.send_input.setToolTip(self._send_hint())
 
     def _on_send(self) -> None:
         text = self.send_input.text().strip()
@@ -3431,7 +3576,6 @@ class FloatingWindow(QWidget):
             (self.room_input, self.room_arrow),
             (self.account_box, self.account_arrow),
             (self.medal_box, self.medal_arrow),
-            (self.mode_box, self.mode_arrow),
         ):
             arrow.setGeometry(combo.width() - 18, 0, 16, combo.height())
 
