@@ -25,8 +25,8 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizeGrip,
-    QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
-    QWidgetAction,
+    QSizePolicy, QSpinBox, QSpacerItem, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout,
+    QWidget, QWidgetAction,
 )
 
 from .accounts import account_meta_path, load_meta, save_meta, scan_accounts
@@ -85,8 +85,12 @@ EMOTICON_PANEL_W = (
 EMOTICON_PANEL_H = 268
 # 标题滚动的下限：再窄就只剩几个字在爬，不如把地方让给右边几个按钮
 MARQUEE_MIN_WIDTH = 64
-# 窗口窄于这个宽度时，「在线 / 舰长」从房间号那一行挪到账号下面一行
-STAT_INLINE_WIDTH = 430
+# 账号行：两个下拉的上限宽度（178 + 186）加上间距和边距，低于这个宽度它们
+# 就吃不满原来的尺寸了，右边那段留白再留着只会白占地方，直接摘掉
+IDENTITY_SPACER_WIDTH = 420
+# 窗口窄于这个宽度时，房间号那一行的右侧已经装不下「在线 12.3万 · 舰长 2721」
+# （实测要 198px，510 左右才够，留点余量），把状态字挪到账号下面一行并靠右
+STAT_INLINE_WIDTH = 520
 
 
 # ---------------- config helpers ----------------
@@ -990,6 +994,8 @@ class FloatingWindow(QWidget):
         self._geo_timer: QTimer | None = None
         # 「在线 / 舰长」现在挂在房间号那一行，窄窗口时挪到账号下面一行
         self._stat_inline = False
+        # 账号行右边那段留白，窄窗口时摘掉
+        self._identity_spacer_in = True
 
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
@@ -1292,9 +1298,13 @@ class FloatingWindow(QWidget):
         self._populate_accounts()
         self._fill_medal_box()
         # 右边留白：窗口拖宽时两个下拉到上限就停住，靠这段把多余的宽度吃掉，
-        # 账号和牌子才不会一个贴左一个飘到中间。spacer 的 stretch 压得很低，
-        # 窄窗口时宽度还是优先给两个下拉
-        row.addStretch(1)
+        # 账号和牌子才不会一个贴左一个飘到中间。窄窗口时这段会被摘掉（见
+        # _place_identity_spacer），宽度全给两个下拉
+        self._identity_row = row
+        self._identity_spacer = QSpacerItem(
+            0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum
+        )
+        row.addSpacerItem(self._identity_spacer)
         return row
 
     def _combo_arrow(self, combo: QComboBox) -> QLabel:
@@ -2714,17 +2724,29 @@ class FloatingWindow(QWidget):
         self._queue_geometry_save()
 
     def _sync_compact_chrome(self) -> None:
-        """窄窗口下把「在线 / 舰长」挪到账号下面一行。
+        """窄模式：状态字挪到账号下面一行、账号行右边不再留白。
 
-        标题不再按宽度藏起来了：装不下会自己滚（见 MarqueeLabel）。
+        标题不按宽度藏：装不下会自己滚（见 MarqueeLabel）。
         """
-        self._place_stat_label(self.width() < STAT_INLINE_WIDTH)
+        width = self.width()
+        self._place_stat_label(width < STAT_INLINE_WIDTH)
+        self._place_identity_spacer(width >= IDENTITY_SPACER_WIDTH)
+
+    def _place_identity_spacer(self, present: bool) -> None:
+        """窄的时候把账号行末尾的留白摘掉，让两个下拉铺满整行。"""
+        if present == self._identity_spacer_in:
+            return
+        self._identity_spacer_in = present
+        if present:
+            self._identity_row.addSpacerItem(self._identity_spacer)
+        else:
+            self._identity_row.removeItem(self._identity_spacer)
 
     def _place_stat_label(self, inline: bool) -> None:
         """把状态字在「房间号那一行右侧」和「账号下面一行」之间搬。
 
-        QLabel 只能待在一个布局里，所以是 remove + add；两边都 setAlignment，
-        免得在窄行里被 Ignored 策略压成 0 宽。
+        QLabel 只能待在一个布局里，所以是 remove + add。窄行里靠右对齐，
+        跟右上角的几个按钮对齐；宽行里本来就是右对齐。
         """
         if inline == self._stat_inline:
             return
@@ -2732,9 +2754,9 @@ class FloatingWindow(QWidget):
         if inline:
             self._footer.removeWidget(self.stat_label)
             self.stat_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-            self.stat_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self._stat_row.addWidget(self.stat_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            self.stat_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self._stat_row.addStretch(1)
+            self._stat_row.addWidget(self.stat_label, 0, Qt.AlignRight | Qt.AlignVCenter)
         else:
             self._stat_row.removeWidget(self.stat_label)
             while self._stat_row.count():
