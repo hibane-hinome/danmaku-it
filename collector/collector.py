@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import re
 import time
 from collections.abc import Callable
 
@@ -18,6 +20,12 @@ from .storage import Storage, extract_event, extract_sc
 log = logging.getLogger("sc_collector")
 
 AUTH_TIMEOUT_SECONDS = 12.0
+
+# 表情显示高度：小表情原图就是 20px，房间大表情 / 收藏集是 162px
+EMOTE_PX = 20
+EMOTE_BIG_PX = 40
+# 正文里的表情占位：B站写的是 [名字]，名字最长见过 20 来个字（收藏集）
+EMOTE_TOKEN_RE = re.compile(r"\[([^\[\]\s][^\[\]]{0,31})\]")
 
 
 def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
@@ -45,7 +53,9 @@ def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
     if not guard_level:
         guard_level = int((user_node.get("guard") or {}).get("level") or 0)
 
-    emote = _emoticon_node(info[0])
+    single, table = _emoticon_payload(info[0])
+    text = str(info[1] or "")
+    emote_map = _used_emotes(text, single, table)
 
     return {
         "room_id": room_id,
@@ -58,11 +68,14 @@ def build_danmaku(room_id: int, info: list, received_at: int) -> dict | None:
         "medal_level": int(medal.get("level") or 0),
         "guard_level": guard_level,
         "is_admin": 1 if len(profile) > 2 and profile[2] else 0,
-        # 图片地址只给界面用，不入库。界面目前只取 emote_url；
+        # 图片地址只给界面用，不入库。界面目前只取 emote_url / emote_map；
         # face 保留在事件里（零成本，不下载），将来要加回头像不必再改这一层
         "face": _https(base.get("face") or ""),
-        "is_emoticon": 1 if emote else 0,
-        "emote_url": _https(emote.get("url") or ""),
+        "is_emoticon": 1 if single else 0,
+        "emote_url": _https(single.get("url") or ""),
+        "emote_px": _emote_px(single),
+        # 正文里夹着的小表情：[名字] → [图地址, 显示高度]
+        "emote_map": emote_map,
     }
 
 
@@ -71,21 +84,79 @@ def _https(url: str) -> str:
     return url.replace("http://", "https://", 1) if url.startswith("http://") else url
 
 
-def _emoticon_node(head: object) -> dict:
-    """Return the emoticon payload of a danmaku, or {} for plain text.
+def _emote_key(name: object) -> str:
+    """表情名去掉中括号：``[大哭]`` 和 ``大哭`` 都映射到同一个键。"""
+    return str(name or "").strip().strip("[]").strip()
 
-    Bilibili sends emoticons as a dict at info[0][13]; some builds put it at
-    info[0][12] instead, so both are checked. The visible text is the
-    emoticon's name (e.g. "敢耍俺").
+
+def _emote_px(node: dict) -> int:
+    """显示高度按原图给：20px 的小表情照原样，162px 的房间大表情给 40。"""
+    try:
+        height = int(node.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    return EMOTE_BIG_PX if height > 64 else EMOTE_PX
+
+
+def _emoticon_payload(head: object) -> tuple[dict, dict[str, dict]]:
+    """拆出一条弹幕里的表情。
+
+    返回 ``(整条表情, 名字→表情节点)``。实测（2026-11）有三种形态：
+
+    1. 房间/通用大表情、收藏集表情：``info[0][13]`` 是个 dict 且带 ``url``，
+       正文可能是纯词（``可爱猫猫``），也可能自带中括号（``[2025嘉然的画册_睡了]``）。
+    2. 老式小表情：``info[0][13]`` 是字符串 ``"{}"``，名字和图片在
+       ``info[0][15]["extra"]`` 这个 JSON 串的 ``emots`` 里，键带中括号（``"[大哭]"``）。
+    3. 普通弹幕：两处都没有。
     """
+    single: dict = {}
+    table: dict[str, dict] = {}
     if not isinstance(head, list):
-        return {}
+        return single, table
+
     for index in (13, 12):
-        if len(head) > index and isinstance(head[index], dict):
-            node = head[index]
-            if node.get("url") or node.get("emoticon_unique"):
-                return node
-    return {}
+        if len(head) <= index or not isinstance(head[index], dict):
+            continue
+        node = head[index]
+        if node.get("url") or node.get("emoticon_unique"):
+            single = single or node
+        for name, item in (node.get("emots") or {}).items():
+            if isinstance(item, dict) and item.get("url"):
+                table.setdefault(_emote_key(name), item)
+
+    for index in (15, 14):
+        node = head[index] if len(head) > index else None
+        if not isinstance(node, dict) or not node.get("extra"):
+            continue
+        try:
+            extra = json.loads(node["extra"])
+        except (TypeError, ValueError):
+            extra = None
+        if isinstance(extra, dict):
+            for name, item in (extra.get("emots") or {}).items():
+                if isinstance(item, dict) and item.get("url"):
+                    table.setdefault(_emote_key(name), item)
+        break
+
+    return single, table
+
+
+def _used_emotes(text: str, single: dict, table: dict[str, dict]) -> dict[str, list]:
+    """只留正文里真的出现了的表情：``{名字: [图地址, 显示高度]}``。
+
+    整条就是一个表情时（大表情、收藏集），正文写的是表情名，也塞进来一份，
+    这样界面只走一条渲染路径。
+    """
+    used: dict[str, list] = {}
+    for name, node in table.items():
+        if name and f"[{name}]" in text:
+            used[name] = [_https(str(node.get("url") or "")), _emote_px(node)]
+    if single:
+        url = _https(str(single.get("url") or ""))
+        name = _emote_key(text)
+        if url and name and text.strip().startswith("[") and text.strip().endswith("]"):
+            used.setdefault(name, [url, _emote_px(single)])
+    return used
 
 
 class RoomCollector:

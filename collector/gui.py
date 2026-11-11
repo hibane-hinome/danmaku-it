@@ -7,15 +7,18 @@ import html
 import json
 import os
 import queue
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from string import Template
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter, QPixmap,
+    QAction, QBrush, QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter,
+    QPixmap,
     QTextBlockUserData, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -49,6 +52,12 @@ TICK_MS = 30
 IMAGE_WAIT_SECONDS = 0.4
 MAX_PENDING_DANMAKU = 200
 EMOTE_PX = 20
+# 房间大表情 / 收藏集的表情原图比小表情大得多，照 20px 画就糊成一团
+EMOTE_BIG_PX = 40
+# 正文里的表情占位：[名字]（老式小表情、收藏集表情都写成这样）
+EMOTE_TOKEN = re.compile(r"\[([^\[\]\s][^\[\]]{0,31})\]")
+# 透明悬浮：底板不透明度 0–100，0 = 连底板都没有，只剩字
+OVERLAY_ALPHA = 45
 # 账号下拉里的头像边长（取 2 倍再缩，缩放后更干净）
 AVATAR_PX = 18
 # 表情面板：按钮尺寸、每行几个、面板宽高
@@ -240,9 +249,9 @@ class CollectorService:
 
 DARK_STYLE = """
 QFrame#panel {
-    background-color: rgba(24, 26, 30, 242);
-    border: 1px solid rgba(255, 255, 255, 32);
-    border-radius: 14px;
+    background-color: $panel_bg;
+    border: $panel_border;
+    border-radius: $panel_radius;
 }
 QLabel { color: #d6d8dd; font-size: 12px; }
 QLabel#title { color: #f0f2f5; font-size: 13px; font-weight: 600; }
@@ -251,9 +260,9 @@ QLabel#section { color: #f0a020; font-size: 12px; font-weight: 600; }
 QLabel#live  { color: #4ade80; font-size: 11px; }
 QLabel#dead  { color: #f87171; font-size: 11px; }
 QPlainTextEdit, QTextBrowser {
-    background: rgba(14, 15, 18, 200);
+    background: $view_bg;
     color: #e8eaee;
-    border: none;
+    border: $view_border;
     border-radius: 8px;
     padding: 6px;
     font-size: 12px;
@@ -342,9 +351,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
 
 LIGHT_STYLE = """
 QFrame#panel {
-    background-color: #f7f8fa;
-    border: 1px solid #d8dee6;
-    border-radius: 10px;
+    background-color: $panel_bg;
+    border: $panel_border;
+    border-radius: $panel_radius;
 }
 QLabel { color: #374151; font-size: 12px; }
 QLabel#title { color: #111827; font-size: 13px; font-weight: 600; }
@@ -353,9 +362,9 @@ QLabel#section { color: #b45309; font-size: 12px; font-weight: 600; }
 QLabel#live  { color: #16a34a; font-size: 11px; }
 QLabel#dead  { color: #dc2626; font-size: 11px; }
 QPlainTextEdit, QTextBrowser {
-    background: #ffffff;
+    background: $view_bg;
     color: #1f2328;
-    border: 1px solid #e3e7ee;
+    border: $view_border;
     border-radius: 6px;
     padding: 6px;
     font-size: 12px;
@@ -777,6 +786,23 @@ class PaneDragHandle(QObject):
         return False
 
 
+class OverlayMouseFilter(QObject):
+    """透明模式下抢走日志列表里的左键：左键拖窗、双击退出。
+
+    窗口没有边框，透明之后整块都是文字区，不接管左键就没地方拖。滚轮和右键
+    照旧透给 QTextBrowser——右键菜单里能退出透明模式。
+    """
+
+    def __init__(self, window: "FloatingWindow") -> None:
+        super().__init__(window)
+        self.window = window
+
+    def eventFilter(self, obj: QObject, event) -> bool:  # noqa: ARG002 - obj 用不上
+        if self.window._overlay and self.window._on_overlay_mouse(event):
+            return True
+        return False
+
+
 class FloatingWindow(QWidget):
     def __init__(self, config_path: str) -> None:
         super().__init__()
@@ -842,6 +868,12 @@ class FloatingWindow(QWidget):
         self._mock_stop: threading.Event | None = None
         # 0 号直播间：本地回放 + 本地回显发送，用来调试发送行
         self._test_mode = False
+        # 透明悬浮：底板是否隐去、以及拖窗时的起点
+        self._overlay = False
+        self._overlay_drag: QPoint | None = None
+        # 表情名 → (图地址, 高度)：本房间表情包的那一份，包列表换了才重建
+        self._emote_index_src: list[dict] | None = None
+        self._emote_index: dict[str, tuple[str, int]] = {}
         # 窗口尺寸落盘：还原完成前不许写，免得启动时的 resize 把旧值冲掉
         self._geo_ready = False
         self._geo_timer: QTimer | None = None
@@ -854,11 +886,17 @@ class FloatingWindow(QWidget):
         self.setMinimumSize(540, 320)
 
         self._build()
+        # 透明模式要在列表上接管左键；视图的鼠标事件落在 viewport 上
+        self._overlay_filter = OverlayMouseFilter(self)
+        for view in (self.danmaku, self.event_view, self.sc_view):
+            view.viewport().installEventFilter(self._overlay_filter)
         self._apply_theme(clear=False)
         self._restore_pane_order()
         self._restore_layout()
         self._restore_panes()
         self._restore_geometry()
+        # 上次是透明模式就照旧，不必每次启动都手动点一次
+        self._set_overlay(bool(self.cfg.get("overlay")), persist=False)
         # 昵称/头像走后台，别让启动等网络
         self._request_account_meta()
 
@@ -897,10 +935,13 @@ class FloatingWindow(QWidget):
         self._c = THEME_COLORS[self.theme]
         colors = self._c
 
-        self.setStyleSheet(DARK_STYLE if self.theme == "dark" else LIGHT_STYLE)
+        self.setStyleSheet(self._stylesheet())
         self.splitter.setStyleSheet(
-            f"QSplitter::handle {{ background: {colors['split']}; }}"
+            "QSplitter::handle { background: %s; }"
+            % ("transparent" if self._overlay else colors["split"])
         )
+        # 投影在透明模式下要关掉：否则整块底板的光晕会留在桌面上
+        self._shadow.setEnabled(not self._overlay)
         self._shadow.setColor(QColor(*colors["shadow"]))
         for arrow in (
             getattr(self, "room_arrow", None),
@@ -934,16 +975,130 @@ class FloatingWindow(QWidget):
         if hasattr(self, "send_btn"):
             self._refresh_send_state()
 
+        self._sync_chrome()
+
     def _on_system_theme_changed(self, scheme) -> None:
         if str(self.cfg.get("theme", "dark")) != "system":
             return
         self._apply_theme("dark" if scheme == Qt.ColorScheme.Dark else "light")
+
+    # ----- 透明悬浮 -----
+
+    def _overlay_alpha(self) -> int:
+        try:
+            return max(0, min(100, int(self.cfg.get("overlay_alpha", OVERLAY_ALPHA))))
+        except (TypeError, ValueError):
+            return OVERLAY_ALPHA
+
+    def _panel_palette(self) -> dict[str, str]:
+        """底板、内容区、投影这几个颜色是随「透明模式 + 不透明度」变的。
+
+        QSS 是一整块字符串，没法在运行时改单条规则，所以做成模板再填。
+        """
+        dark = self.theme == "dark"
+        if not self._overlay:
+            return {
+                "panel_bg": "rgba(24, 26, 30, 242)" if dark else "#f7f8fa",
+                "panel_border": (
+                    "1px solid rgba(255, 255, 255, 32)" if dark else "1px solid #d8dee6"
+                ),
+                "panel_radius": "14px" if dark else "10px",
+                "view_bg": "rgba(14, 15, 18, 200)" if dark else "#ffffff",
+                "view_border": "none" if dark else "1px solid #e3e7ee",
+            }
+
+        level = round(self._overlay_alpha() * 255 / 100)
+        rgb = "8, 9, 11" if dark else "247, 248, 250"
+        # 完全不透明 = 只有字：连描边都不留，否则桌上会多出一圈细线
+        border = "none" if level == 0 else (
+            "1px solid rgba(255, 255, 255, 18)" if dark else "1px solid rgba(15, 23, 42, 26)"
+        )
+        return {
+            "panel_bg": f"rgba({rgb}, {level})",
+            "panel_border": border,
+            "panel_radius": "0px",
+            "view_bg": "transparent",
+            "view_border": "none",
+        }
+
+    def _stylesheet(self) -> str:
+        template = DARK_STYLE if self.theme == "dark" else LIGHT_STYLE
+        return Template(template).substitute(self._panel_palette())
+
+    def _chrome_widgets(self) -> list[QWidget]:
+        """透明模式下要收起来的一整套操作控件（只留弹幕正文）。"""
+        names = (
+            "dot", "title_label", "overlay_btn", "pin_btn", "settings_btn", "close_btn",
+            "room_input", "room_arrow", "connect_btn", "pane_btn", "stat_label",
+            "account_box", "account_arrow", "medal_box", "medal_arrow",
+            "send_input", "emote_btn", "color_btn", "mode_box", "mode_arrow", "send_btn",
+            "grip", "danmaku_title", "event_title", "sc_title",
+        )
+        widgets = [getattr(self, name, None) for name in names]
+        widgets.extend(self._drag_handles.values())
+        widgets.extend(getattr(self, "event_filters", {}).values())
+        return [widget for widget in widgets if widget is not None]
+
+    def _set_overlay(self, on: bool, persist: bool = True) -> None:
+        """透明悬浮：底板隐去、操作控件收起，窗口只剩弹幕。
+
+        拖动/退出靠 ``OverlayMouseFilter``（双击退出、左键拖走），
+        右键菜单里也有「退出透明模式」。
+        """
+        on = bool(on)
+        if on == self._overlay:
+            return
+        self._overlay = on
+        self._overlay_drag = None
+        self.overlay_btn.blockSignals(True)
+        self.overlay_btn.setChecked(on)
+        self.overlay_btn.blockSignals(False)
+        self._apply_theme(clear=False)
+        if persist:
+            self.cfg["overlay"] = on
+            self._save_config_quiet()
+        if on:
+            self._append_sys("透明模式：双击窗口或右键菜单退出，按住左键可以拖走")
+
+    def _sync_chrome(self) -> None:
+        """按透明模式收起/放回操作控件，并把外边距让出来。"""
+        for widget in self._chrome_widgets():
+            widget.setVisible(not self._overlay)
+        margin = 0 if self._overlay else 10
+        self._outer.setContentsMargins(margin, margin, margin, margin)
+
+    def _on_overlay_mouse(self, event) -> bool:
+        """透明模式下的鼠标：左键拖窗、双击退出。返回 True 表示吃掉这个事件。"""
+        kind = event.type()
+        if kind == QEvent.MouseButtonDblClick:
+            if event.button() == Qt.LeftButton:
+                self._set_overlay(False)
+                return True
+            return False
+        if kind == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                self._overlay_drag = (
+                    event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                )
+                return True
+            return False
+        if kind == QEvent.MouseMove:
+            if self._overlay_drag is not None and event.buttons() & Qt.LeftButton:
+                self.move(event.globalPosition().toPoint() - self._overlay_drag)
+                return True
+            return False
+        if kind == QEvent.MouseButtonRelease:
+            if self._overlay_drag is not None:
+                self._overlay_drag = None
+                return True
+        return False
 
     # ----- construction -----
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
+        self._outer = outer
 
         panel = QFrame(self)
         panel.setObjectName("panel")
@@ -1029,6 +1184,18 @@ class FloatingWindow(QWidget):
         self.title_label.setObjectName("title")
         header.addWidget(self.title_label, 1)
 
+        self.overlay_btn = QPushButton("透明")
+        self.overlay_btn.setObjectName("ghost")
+        self.overlay_btn.setCheckable(True)
+        # 固定宽度：勾上之后按钮会藏起来，宽度变来变去会让整行抖
+        self.overlay_btn.setFixedWidth(46)
+        self.overlay_btn.setToolTip(
+            "透明悬浮：去掉底板，只把弹幕留在画面上。\n"
+            "透明时双击窗口退出，按住左键可拖动，右键有菜单"
+        )
+        self.overlay_btn.clicked.connect(self._toggle_overlay)
+        header.addWidget(self.overlay_btn)
+
         self.pin_btn = QPushButton()
         self.pin_btn.setObjectName("ghost")
         self.pin_btn.setCheckable(True)
@@ -1044,11 +1211,17 @@ class FloatingWindow(QWidget):
         self.settings_btn.clicked.connect(self._open_settings)
         header.addWidget(self.settings_btn)
 
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("ghost")
-        close_btn.clicked.connect(self.close)
-        header.addWidget(close_btn)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setObjectName("ghost")
+        self.close_btn.clicked.connect(self.close)
+        header.addWidget(self.close_btn)
         return header
+
+    def _toggle_overlay(self) -> None:
+        self._set_overlay(self.overlay_btn.isChecked())
+        if self._overlay:
+            # 按钮已经藏起来了，给个能看见的提示
+            self.overlay_btn.setToolTip("透明模式已开启")
 
     def _build_identity_row(self) -> QHBoxLayout:
         """发送身份：用哪个账号发、戴哪个粉丝牌。"""
@@ -1921,7 +2094,8 @@ class FloatingWindow(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(10)
         row.addWidget(self._make_drag_handle("event"))
-        row.addWidget(self._section_label("事件"))
+        self.event_title = self._section_label("事件")
+        row.addWidget(self.event_title)
         row.addStretch(1)
         self.event_filters: dict[str, QCheckBox] = {}
         # Enter events are the noisiest, so they start hidden.
@@ -2031,11 +2205,37 @@ class FloatingWindow(QWidget):
 
     def _show_clear_menu(self, view: QTextBrowser, pos: QPoint, handler) -> None:
         menu = QMenu(view)
+        if self._overlay:
+            # 透明模式下左下角什么都没有了，右键是唯一的出口
+            menu.addAction("退出透明模式", lambda: self._set_overlay(False))
+            menu.addAction("设置…", self._open_settings)
+            menu.addSeparator()
         copy_action = menu.addAction("复制", view.copy)
         copy_action.setEnabled(view.textCursor().hasSelection())
         menu.addSeparator()
         menu.addAction("清空本栏", handler)
         menu.exec(view.mapToGlobal(pos))
+
+    def contextMenuEvent(self, event) -> None:
+        """窗口空白处（透明模式下就是文字之间的缝）的右键菜单。"""
+        menu = QMenu(self)
+        if self._overlay:
+            menu.addAction("退出透明模式", lambda: self._set_overlay(False))
+        else:
+            menu.addAction("进入透明模式", lambda: self._set_overlay(True))
+        menu.addAction(
+            "取消置顶" if self.pin_btn.isChecked() else "置顶",
+            lambda: self._set_topmost(not self.pin_btn.isChecked()),
+        )
+        panes = menu.addMenu("栏目")
+        for key in ("danmaku", "event", "sc"):
+            action = self._pane_actions.get(key)
+            if action is not None:
+                panes.addAction(action)
+        menu.addSeparator()
+        menu.addAction("清空弹幕", self._clear_danmaku)
+        menu.addAction("设置…", self._open_settings)
+        menu.exec(event.globalPos())
 
     def _clear_danmaku(self) -> None:
         self.danmaku.clear()
@@ -2255,7 +2455,13 @@ class FloatingWindow(QWidget):
         self._queue_geometry_save()
 
     def _toggle_topmost(self) -> None:
-        on = self.pin_btn.isChecked()
+        self._set_topmost(not self.pin_btn.isChecked())
+
+    def _set_topmost(self, on: bool) -> None:
+        if self.pin_btn.isChecked() != on:
+            self.pin_btn.blockSignals(True)
+            self.pin_btn.setChecked(on)
+            self.pin_btn.blockSignals(False)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
         self.show()
         self._sync_pin_button()
@@ -2849,13 +3055,68 @@ class FloatingWindow(QWidget):
                 row["_queued_at"] = 0.0
         self._flush_danmaku()
 
-    @staticmethod
-    def _row_image_urls(row: dict) -> list[str]:
+    def _emote_index_map(self) -> dict[str, tuple[str, int]]:
+        """表情名 → (图地址, 高度)，取自账号在当前房间能用的表情包。
+
+        老式小表情（``[偷笑]`` 这类）payload 里只有名字没有图，靠这份表兜底；
+        表情包换了才重建，平时就是一次字典查找。
+        """
+        packages = self._emote_packages
+        if packages is self._emote_index_src:
+            return self._emote_index
+        index: dict[str, tuple[str, int]] = {}
+        for package in packages or []:
+            for item in package.get("items") or []:
+                name = str(item.get("text") or "").strip().strip("[]")
+                url = str(item.get("url") or "")
+                # dm_type=0 的是纯文本表情包（发 [dog] 这种），没有图
+                if name and url and item.get("dm_type"):
+                    index.setdefault(name, (url, EMOTE_PX))
+        self._emote_index_src = packages
+        self._emote_index = index
+        return index
+
+    def _row_emotes(self, row: dict) -> dict[str, tuple[str, int]]:
+        """这一行里能画成图的表情：``{名字: (图地址, 显示高度)}``。
+
+        优先级：弹幕报文自带的表情表 → 本房间表情包。前者含房间大表情和
+        收藏集，后者只用来补老式小表情。
+        """
+        text = str(row.get("text") or "")
+        found: dict[str, tuple[str, int]] = {}
+        for name, info in (row.get("emote_map") or {}).items():
+            try:
+                url, px = str(info[0] or ""), int(info[1] or EMOTE_PX)
+            except (IndexError, TypeError, ValueError):
+                continue
+            if url:
+                found[str(name)] = (url, px)
+
+        if row.get("is_emoticon") and not found:
+            # 整条就是一个表情：正文写的是表情名，不带中括号
+            url = str(row.get("emote_url") or "")
+            if url:
+                try:
+                    px = int(row.get("emote_px") or EMOTE_PX)
+                except (TypeError, ValueError):
+                    px = EMOTE_PX
+                found[text] = (url, px)
+                return found
+            # 没图（0 号回放的老行只有 is_emoticon 标记）：按文字继续走兜底索引
+
+        index = self._emote_index_map()
+        for match in EMOTE_TOKEN.finditer(text):
+            name = match.group(1)
+            if name in found:
+                continue
+            hit = index.get(name)
+            if hit is not None:
+                found[name] = hit
+        return found
+
+    def _row_image_urls(self, row: dict) -> list[str]:
         """只下载表情图。头像是一人一图、几乎不命中缓存，量大且没多少人看，不取。"""
-        if row.get("is_emoticon"):
-            url = row.get("emote_url") or ""
-            return [url] if url else []
-        return []
+        return [url for url, _px in self._row_emotes(row).values()]
 
     def _flush_danmaku(self) -> None:
         """按到达顺序上屏；队头还在等图就停住，避免后面的弹幕插队。"""
@@ -2985,6 +3246,49 @@ class FloatingWindow(QWidget):
             fmt.clearBackground()
         cursor.setBlockFormat(fmt)
 
+    def _text_html(self, row: dict) -> str:
+        """正文：普通文字照原样，``[名字]`` 能对上图就画图、对不上留着字。
+
+        B站把老式小表情写成 ``[大哭]`` 这种占位符，图片地址在报文的表情表里
+        （或者本房间表情包里），所以这里要逐段替换，不能整条 escape 了事。
+        """
+        raw = str(row.get("text") or "")
+        emotes = self._row_emotes(row)
+        if not emotes:
+            return f'<span style="color:{self._c["text"]}">{html.escape(raw)}</span>'
+
+        if row.get("is_emoticon") and not any(f"[{name}]" in raw for name in emotes):
+            # 整条就是一个表情（房间大表情 / 通用表情：正文写的是表情名）
+            url, px = next(iter(emotes.values()))
+            image = self._images.image(url)
+            if image is not None:
+                width, height = self._image_size(image, px)
+                return f'<img src="{html.escape(url)}" width="{width}" height="{height}">'
+            return f'<span style="color:{self._c["emoticon"]}">[{html.escape(raw)}]</span>'
+
+        out: list[str] = []
+        pos = 0
+
+        def add_text(chunk: str) -> None:
+            if chunk:
+                out.append(f'<span style="color:{self._c["text"]}">{html.escape(chunk)}</span>')
+
+        for match in EMOTE_TOKEN.finditer(raw):
+            hit = emotes.get(match.group(1))
+            if hit is None:
+                continue
+            url, px = hit
+            image = self._images.image(url)
+            if image is None:
+                # 图还没下完或下载失败：这一段原样留着，等补画那一行
+                continue
+            add_text(raw[pos:match.start()])
+            width, height = self._image_size(image, px)
+            out.append(f'<img src="{html.escape(url)}" width="{width}" height="{height}">')
+            pos = match.end()
+        add_text(raw[pos:])
+        return "".join(out)
+
     def _danmaku_html(self, row: dict) -> str:
         event_time = row.get("event_time") or 0
         stamp = (
@@ -3020,20 +3324,8 @@ class FloatingWindow(QWidget):
         else:
             parts.append(f'<span style="color:{self._c["user"]}">{uname}</span>:')
 
-        text = html.escape(row.get("text") or "")
-        if row.get("is_emoticon"):
-            emote_url = row.get("emote_url") or ""
-            emote = self._images.image(emote_url)
-            if emote is not None:
-                width, height = self._image_size(emote, EMOTE_PX)
-                parts.append(
-                    f'<img src="{html.escape(emote_url)}" width="{width}" height="{height}">'
-                )
-            else:
-                # 图还没到或下载失败，先按原来的青色 [名字] 显示
-                parts.append(f'<span style="color:{self._c["emoticon"]}">[{text}]</span>')
-        else:
-            parts.append(f'<span style="color:{self._c["text"]}">{text}</span>')
+        # 正文交给 _text_html：里面的 [名字] 能对上图的会被换成图片
+        parts.append(self._text_html(row))
         if row.get("_test"):
             # 测试模式的回显带上这次发送用的颜色和位置，方便对照
             mode = dict(MODES).get(int(row.get("_mode") or 1), "滚动")
@@ -3183,7 +3475,10 @@ class FloatingWindow(QWidget):
             self._settings.deleteLater()
         self._settings = SettingsPopup(self)
         self._settings.adjustSize()
-        self._settings.popup_at(self.settings_btn)
+        # 透明模式下「设置」按钮是收起来的，贴着光标弹
+        self._settings.popup_at(
+            self.settings_btn, at=QCursor.pos() if self._overlay else None
+        )
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -3347,6 +3642,17 @@ class SettingsPopup(QDialog):
         self.theme_box.setCurrentIndex(index if index >= 0 else 0)
         form.addRow("主题", self.theme_box)
 
+        self.overlay_alpha = QSpinBox()
+        self.overlay_alpha.setRange(0, 100)
+        self.overlay_alpha.setSingleStep(5)
+        self.overlay_alpha.setSuffix(" %")
+        self.overlay_alpha.setValue(int(cfg.get("overlay_alpha", OVERLAY_ALPHA)))
+        self.overlay_alpha.setToolTip(
+            "只在透明模式下生效：底板的不透明度。\n"
+            "0% = 连底板都不画，桌面上只剩字；要退出透明模式双击窗口或右键"
+        )
+        form.addRow("透明底板不透明度", self.overlay_alpha)
+
         self.cookie_dir = QLineEdit(str(cfg.get("cookie_dir", "")))
         self.cookie_dir.setPlaceholderText("放 cookie 文件的目录，可以放多个 csv，启动时自动扫描")
         form.addRow("账号目录", self._with_dir_browse(self.cookie_dir))
@@ -3367,13 +3673,21 @@ class SettingsPopup(QDialog):
         self.raise_()
         self.activateWindow()
 
-    def popup_at(self, anchor: QWidget) -> None:
-        """贴在按钮下方弹出；下面放不下就翻到上面，横向右对齐。"""
-        corner = anchor.mapToGlobal(QPoint(0, 0))
-        screen = anchor.screen() or QApplication.primaryScreen()
+    def popup_at(self, anchor: QWidget | None = None, at: QPoint | None = None) -> None:
+        """贴在按钮下方弹出；下面放不下就翻到上面，横向右对齐。
+
+        ``at`` 是鼠标位置：透明模式下按钮收起来了，只能贴着光标弹。
+        """
+        if at is not None:
+            corner, width, height = at, 0, 0
+            screen = QApplication.screenAt(at) or QApplication.primaryScreen()
+        else:
+            corner = anchor.mapToGlobal(QPoint(0, 0))
+            width, height = anchor.width(), anchor.height()
+            screen = anchor.screen() or QApplication.primaryScreen()
         area = screen.availableGeometry()
-        x = corner.x() + anchor.width() - self.width()
-        y = corner.y() + anchor.height() + 6
+        x = corner.x() + width - self.width()
+        y = corner.y() + height + 6
         if y + self.height() > area.bottom() - 4:
             y = max(area.top() + 4, corner.y() - self.height() - 6)
         x = max(area.left() + 4, min(x, area.right() - self.width() - 4))
@@ -3478,6 +3792,7 @@ class SettingsPopup(QDialog):
             "log_level": self.level.currentText(),
             "cookie_dir": cookie_dir,
             "theme": theme,
+            "overlay_alpha": self.overlay_alpha.value(),
         })
         owner.danmaku.document().setMaximumBlockCount(self.max_blocks.value())
         owner._reload_sender()
