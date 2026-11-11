@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout, QLabel,
     QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizeGrip,
-    QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget, QWidgetAction,
+    QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from .accounts import account_meta_path, load_meta, save_meta, scan_accounts
@@ -771,6 +772,23 @@ class EmoticonPanel(QWidget):
         super().hideEvent(event)
 
 
+class ComboArrowFollower(QObject):
+    """下拉框右边的 ▾ 跟着走。
+
+    箭头是盖在 combo 上的独立 label，位置按 combo 宽度算。以前 combo 宽度
+    写死，摆一次就够；现在会随窗口挤压，得在 combo 自己 resize 时重摆。
+    """
+
+    def __init__(self, arrow: QLabel) -> None:
+        super().__init__(arrow)
+        self.arrow = arrow
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Resize:
+            self.arrow.setGeometry(obj.width() - 18, 0, 16, obj.height())
+        return False
+
+
 class PaneDragHandle(QObject):
     """Drag handle that moves a whole pane up or down inside the splitter."""
 
@@ -878,7 +896,8 @@ class FloatingWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(560, 640)
-        self.setMinimumSize(540, 320)
+        # 拖窄的下限：再窄布局就摆不开了（316 是各行的硬底，留一点余量）
+        self.setMinimumSize(320, 300)
 
         self._build()
         self._apply_theme(clear=False)
@@ -1101,7 +1120,11 @@ class FloatingWindow(QWidget):
 
         self.title_label = QLabel(TITLE)
         self.title_label.setObjectName("title")
-        header.addWidget(self.title_label, 1)
+        # 标题只是装饰：窗口拖窄时让它先让位，别把整行撑住（窄了会被藏起来）
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.title_label.setMinimumWidth(0)
+        header.addWidget(self.title_label)
+        header.addStretch(1)
 
         self.pin_btn = QPushButton()
         self.pin_btn.setObjectName("ghost")
@@ -1131,22 +1154,28 @@ class FloatingWindow(QWidget):
         row.setSpacing(5)
 
         self.account_box = QComboBox()
-        self.account_box.setFixedWidth(178)
+        # 账号 / 粉丝牌两个下拉原来写死宽度，直接把窗口宽度卡死；
+        # 改成「窄能缩、宽到原来的尺寸为止」
+        self.account_box.setMinimumWidth(92)
+        self.account_box.setMaximumWidth(178)
         self.account_box.setToolTip("发弹幕用的账号（来自设置里的账号目录）")
         self.account_box.currentIndexChanged.connect(self._on_account_changed)
-        row.addWidget(self.account_box)
+        # 两个下拉各占一半可用宽度：窗口宽时回到原来的尺寸（有 max 卡着），
+        # 拖窄时按指数一起缩，不会把整行撑住
+        self.account_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row.addWidget(self.account_box, 1)
         self.account_arrow = self._combo_arrow(self.account_box)
 
         self.medal_box = QComboBox()
-        self.medal_box.setFixedWidth(186)
+        self.medal_box.setMinimumWidth(104)
+        self.medal_box.setMaximumWidth(186)
         self.medal_box.setToolTip(
             "默认是账号当前戴着的牌子；换一个会立刻改掉账号上的佩戴（弹幕上显示的就是它）"
         )
         self.medal_box.currentIndexChanged.connect(self._on_medal_changed)
-        row.addWidget(self.medal_box)
+        self.medal_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row.addWidget(self.medal_box, 1)
         self.medal_arrow = self._combo_arrow(self.medal_box)
-
-        row.addStretch(1)
 
         # 账号和牌子的状态都在构造完控件后才能填，这里先压一次，避免闪空下拉
         self._populate_accounts()
@@ -1163,6 +1192,7 @@ class FloatingWindow(QWidget):
         arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         arrow.setAlignment(Qt.AlignCenter)
         arrow.setGeometry(combo.width() - 18, 0, 16, combo.height())
+        combo.installEventFilter(ComboArrowFollower(arrow))
         return arrow
 
     def _build_send_row(self) -> QHBoxLayout:
@@ -2051,7 +2081,9 @@ class FloatingWindow(QWidget):
 
         self.room_input = QComboBox()
         self.room_input.setEditable(True)
-        self.room_input.setFixedWidth(148)
+        # 可压缩：窗口拖窄时它跟着缩，宽的时候仍是 148
+        self.room_input.setMinimumWidth(96)
+        self.room_input.setMaximumWidth(148)
         self.room_input.setToolTip(
             "可直接输入房间号；下拉列表可右键删除历史记录。填 0 是本地测试（回放 + 试发）"
         )
@@ -2064,6 +2096,7 @@ class FloatingWindow(QWidget):
         self.room_arrow = QLabel("▾", self.room_input)
         self.room_arrow.setAlignment(Qt.AlignCenter)
         self.room_arrow.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.room_input.installEventFilter(ComboArrowFollower(self.room_arrow))
         self._fill_room_history()
         footer.addWidget(self.room_input)
 
@@ -2089,6 +2122,9 @@ class FloatingWindow(QWidget):
         self.stat_label = QLabel("在线 0 · 舰长 0")
         self.stat_label.setObjectName("stat")
         self.stat_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # 同理：状态字是锦上添花，窄窗口下先收起来，别跟房间号抢地方
+        self.stat_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.stat_label.setMinimumWidth(0)
         footer.addWidget(self.stat_label, 1)
         return footer
 
@@ -2341,7 +2377,24 @@ class FloatingWindow(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # 拖窄时标题/状态字先让位，别让它们撑着整行
+        self._sync_compact_chrome()
         self._queue_geometry_save()
+
+    def _sync_compact_chrome(self) -> None:
+        """窄窗口下收起「标题」「在线/舰长」这两个纯装饰文字。
+
+        它们都有 sizePolicy=Ignored，本来就不会卡住布局；这里再按阈值藏掉，
+        是为了避免出现被裁掉一半的半截字。
+        """
+        width = self.width()
+        for name, limit in (("title_label", 470), ("stat_label", 430)):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            want = width >= limit
+            if widget.isHidden() == want:
+                widget.setVisible(want)
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
