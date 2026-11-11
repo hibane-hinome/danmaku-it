@@ -233,7 +233,13 @@ class RoomCollector:
         self.real_room_id = info["real_room_id"]
         self.title = info.get("title") or ""
         self.storage.upsert_room(self.real_room_id, info["title"], info["uname"])
-        self._emit({"type": "room", "title": self.title, "uname": info.get("uname") or ""})
+        self._emit({
+            "type": "room",
+            "title": self.title,
+            "uname": info.get("uname") or "",
+            # 点赞接口要主播 uid，顺便从这次解析里带回来
+            "anchor_uid": info.get("anchor_uid") or 0,
+        })
         self._emit({"type": "room_stats", "guards": info.get("guard_count", 0)})
         return info
 

@@ -26,7 +26,14 @@ import time
 import urllib.parse
 import urllib.request
 
+from .bili_api import BiliApi
+
 SEND_URL = "https://api.live.bilibili.com/msg/send"
+# 直播间点赞。参数要 wbi 签名（wts + w_rid），csrf 传 bili_jct；
+# 老的 /xlive/web-ucenter/v2/heartbeat/Click 已经不认了
+LIKE_URL = (
+    "https://api.live.bilibili.com/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3"
+)
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 CSRF_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/info?csrf="
 EMOTICON_URL = (
@@ -175,6 +182,8 @@ class DanmakuSender:
         self.uid = 0
         # 已经佩戴的牌子，避免每条弹幕都去 wear 一次
         self.worn_medal = 0
+        # wbi 签名（点赞要用）借 BiliApi 的实现，实例缓存着别每次拉 key
+        self._wbi_api: BiliApi | None = None
         if account is not None:
             self._cookies = dict(account.cookies)
             self.uname = account.uname
@@ -193,6 +202,7 @@ class DanmakuSender:
             path = os.path.normpath(os.path.join(config.get("config_dir") or ".", path))
         self._cookies = load_cookies(path)
         self._jct = self._cookies.get("bili_jct") or ""
+        self._wbi_api = None
 
     @property
     def has_login(self) -> bool:
@@ -390,6 +400,55 @@ class DanmakuSender:
         message = payload.get("message") or payload.get("msg") or ""
         hint = _CODE_HINTS.get(code)
         raise SendError(hint or message or f"发送失败（code={code}）", code)
+
+    # ----- 点赞 -----
+
+    def _wbi(self) -> BiliApi:
+        """点赞接口要 wbi 签名，key 的取法和主站一致，直接借 BiliApi 那套。"""
+        if self._wbi_api is None:
+            self._wbi_api = BiliApi(cookies=self.cookies())
+        return self._wbi_api
+
+    def like(self, room_id: int, anchor_id: int = 0, count: int = 1) -> dict:
+        """给直播间点赞，``count`` 是一次上报的个数（1–10）。
+
+        参数走 query（wts + w_rid 签名），csrf 传 bili_jct；body 是空的。
+        B 站对这个接口有每日上限，超了会回非 0 码，原样抛给界面显示。
+        """
+        if not room_id:
+            raise SendError("还没连上直播间，先点「连接」或填房间号")
+        if not self.has_login:
+            raise SendError("未配置 cookie，无法点赞")
+        if not self._jct and not self.refresh_csrf():
+            raise SendError("缺少 CSRF token，请重新导出 cookie（需要 bili_jct）")
+        if not self.uid:
+            ok, info = self.verify()
+            if not ok:
+                raise SendError(info)
+
+        params = {
+            "click_time": max(1, min(int(count), 10)),
+            "room_id": int(room_id),
+            "uid": int(self.uid or 0),
+            "anchor_id": int(anchor_id or 0),
+            "web_location": "444.8",
+            "csrf": self._jct,
+        }
+        try:
+            query = self._wbi().sign(params)
+            payload = self._post_json(
+                f"{LIKE_URL}?{query}",
+                b"",
+                f"https://live.bilibili.com/{int(room_id)}",
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一包装成 SendError
+            raise SendError(f"网络错误：{exc}") from exc
+
+        code = payload.get("code")
+        if code == 0:
+            return payload.get("data") or {}
+        message = payload.get("message") or payload.get("msg") or ""
+        raise SendError(message or f"点赞失败（code={code}）", code)
 
     # ----- 表情 -----
 

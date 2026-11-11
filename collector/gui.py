@@ -146,6 +146,8 @@ class RoomState:
     online: int = 0
     watched: int = 0
     guards: int = 0
+    # 主播 uid：点赞接口（likeReportV3）要这个，连接时由房间解析带回来
+    anchor_uid: int = 0
 
 
 class ScBlockData(QTextBlockUserData):
@@ -324,26 +326,6 @@ QPushButton:hover { background: rgba(255, 255, 255, 32); }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
-/* 发送按钮右侧的「▾」：跟发送同一个底色，拼成一个按钮。
-   分隔线用独立的 1px 细线（见 _build_send_row），不能写成 border-left：
-   Qt 的四条边框宽度不一致时 border-radius 会直接失效，右边就成了直角 */
-QPushButton#primary[joined="left"] {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-}
-QPushButton#sendmore {
-    background: #2f6fed;
-    border: none;
-    color: white;
-    padding: 0 3px;
-    font-size: 10px;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    border-top-right-radius: 7px;
-    border-bottom-right-radius: 7px;
-}
-QPushButton#sendmore:hover { background: #3b7bf5; }
-QPushButton#sendmore:disabled { background: #2b3240; color: #7d8797; }
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -453,23 +435,6 @@ QPushButton:pressed { background: #e6ebf2; }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #c0392b; }
-QPushButton#primary[joined="left"] {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-}
-QPushButton#sendmore {
-    background: #2f6fed;
-    border: none;
-    color: white;
-    padding: 0 3px;
-    font-size: 10px;
-    border-top-left-radius: 0;
-    border-bottom-left-radius: 0;
-    border-top-right-radius: 7px;
-    border-bottom-right-radius: 7px;
-}
-QPushButton#sendmore:hover { background: #3b7bf5; }
-QPushButton#sendmore:disabled { background: #b9cdf3; color: #ffffff; }
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -893,6 +858,10 @@ class FloatingWindow(QWidget):
         self._sender_path = preferred.path if preferred is not None else ""
         self._send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="send")
         self._send_future: Future | None = None
+        # 点赞单独一个池：它不该排在「发弹幕」后面，也不该挡住下一条
+        self._like_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="like")
+        self._like_future: Future | None = None
+        self._like_count = 0  # 这次连上之后点了多少个赞，只用来写在 tooltip 里
         self._mode_locked = False  # 房间只开放一种位置时锁死选择
         # 位置以前挂在下拉的 currentData 上，现在收进发送按钮的下拉，值自己存
         self._send_mode_value = int(self.cfg.get("send_mode", 1))
@@ -935,8 +904,9 @@ class FloatingWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(560, 640)
-        # 拖窄的下限：再窄布局就摆不开了（316 是各行的硬底，留一点余量）
-        self.setMinimumSize(320, 300)
+        # 拖窄的下限：再窄布局就摆不开了（316 是各行的硬底，留一点余量）；
+        # 高度底线 540，发送区拆成两行后布局的硬底是 526
+        self.setMinimumSize(320, 540)
 
         self._build()
         self._apply_theme(clear=False)
@@ -1019,14 +989,6 @@ class FloatingWindow(QWidget):
         # 换主题会把箭头颜色改回「可用」色，这里按连接状态重新压一压
         if hasattr(self, "send_btn"):
             self._refresh_send_state()
-
-        # 发送和「▾」之间的那根细线：跟着主题反着来，暗底上白线、亮底上黑线
-        if hasattr(self, "send_divider"):
-            self.send_divider.setStyleSheet(
-                "background: rgba(255, 255, 255, 92); border: none;"
-                if self.theme == "dark"
-                else "background: rgba(0, 0, 0, 52); border: none;"
-            )
 
 
     def _on_system_theme_changed(self, scheme) -> None:
@@ -1146,6 +1108,8 @@ class FloatingWindow(QWidget):
         splitter.setSizes([340, 170, 150])
         root.addWidget(splitter, 1)
 
+        # 发送区两行：上面是工具（表情 / 颜色位置 / 点赞），下面是输入框 + 发送
+        root.addLayout(self._build_send_tools_row())
         root.addLayout(self._build_send_row())
 
         grip_row = QHBoxLayout()
@@ -1241,7 +1205,40 @@ class FloatingWindow(QWidget):
         combo.installEventFilter(ComboArrowFollower(arrow))
         return arrow
 
+    def _build_send_tools_row(self) -> QHBoxLayout:
+        """发送区第一行：表情、颜色/位置设置、点赞。"""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+
+        self.emote_btn = QPushButton("表情")
+        self.emote_btn.setObjectName("ghost")
+        self.emote_btn.setFixedWidth(38)
+        self.emote_btn.setToolTip("B 站表情（含本房间专属和账号已解锁的表情包）")
+        self.emote_btn.clicked.connect(self._open_emoticons)
+        row.addWidget(self.emote_btn)
+
+        # 颜色和位置都收在这个按钮的下拉里（图标就是当前颜色）
+        self.send_settings_btn = QPushButton("设置 ▾")
+        self.send_settings_btn.setObjectName("ghost")
+        self.send_settings_btn.setCursor(Qt.PointingHandCursor)
+        self.send_settings_btn.setToolTip("弹幕颜色与位置")
+        self.send_settings_btn.clicked.connect(self._open_send_options)
+        row.addWidget(self.send_settings_btn)
+        self._paint_settings_icon()
+
+        self.like_btn = QPushButton("点赞")
+        self.like_btn.setObjectName("ghost")
+        self.like_btn.setCursor(Qt.PointingHandCursor)
+        self.like_btn.setToolTip("给这个直播间点赞（每点一次 +1，B 站有每日上限）")
+        self.like_btn.clicked.connect(self._on_like)
+        row.addWidget(self.like_btn)
+
+        row.addStretch(1)
+        return row
+
     def _build_send_row(self) -> QHBoxLayout:
+        """发送区第二行：输入框 + 发送。"""
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(5)
@@ -1252,53 +1249,11 @@ class FloatingWindow(QWidget):
         self.send_input.returnPressed.connect(self._on_send)
         row.addWidget(self.send_input, 1)
 
-        self.emote_btn = QPushButton("表情")
-        self.emote_btn.setObjectName("ghost")
-        self.emote_btn.setFixedWidth(38)
-        self.emote_btn.setToolTip("B 站表情（含本房间专属和账号已解锁的表情包）")
-        self.emote_btn.clicked.connect(self._open_emoticons)
-        row.addWidget(self.emote_btn)
-
-        # 发送和它右边的「▾」拼成一个按钮：颜色、位置都收进这个下拉，
-        # 窄窗口下能省出原来色块 + 位置下拉占的两格。
-        # 两个按钮装进零间距容器，再整体放进发送行——发送行的统一间距
-        # 会把它们的缝拉开，看起来就成了两个按钮
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
-        self.send_btn.setProperty("joined", "left")
         self.send_btn.setProperty("active", "false")
         self.send_btn.clicked.connect(self._on_send)
-        self.send_btn.setToolTip(self._send_hint())
-
-        self.send_more = QPushButton("▾")
-        self.send_more.setObjectName("sendmore")
-        self.send_more.setFixedWidth(18)
-        # 按钮垂直方向默认是 Fixed：QSS 把 padding 去掉后 sizeHint 只有
-        # 10px 高，比发送按钮矮一截，也拼不出完整的圆角；改成跟着行拉伸
-        self.send_more.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.send_more.setCursor(Qt.PointingHandCursor)
-        self.send_more.setToolTip("弹幕颜色与位置")
-        self.send_more.clicked.connect(self._open_send_options)
-
-        send_group = QWidget()
-        send_lay = QHBoxLayout(send_group)
-        send_lay.setContentsMargins(0, 0, 0, 0)
-        send_lay.setSpacing(0)
-        # 分隔线是一根独立的 1px 细线，上下各缩 3px：写成 border-left 会让
-        # Qt 的 border-radius 失效（四边框宽不等就不画圆角）
-        self.send_divider = QFrame()
-        self.send_divider.setFixedWidth(1)
-        self.send_divider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        divider_box = QWidget()
-        divider_lay = QVBoxLayout(divider_box)
-        divider_lay.setContentsMargins(0, 3, 0, 3)
-        divider_lay.setSpacing(0)
-        divider_lay.addWidget(self.send_divider)
-
-        send_lay.addWidget(self.send_btn)
-        send_lay.addWidget(divider_box)
-        send_lay.addWidget(self.send_more)
-        row.addWidget(send_group)
+        row.addWidget(self.send_btn)
         return row
 
     # ----- 账号 -----
@@ -1619,6 +1574,7 @@ class FloatingWindow(QWidget):
 
     def _set_send_color(self, value: int, save: bool = True, menu: QMenu | None = None) -> None:
         self.send_color = int(value) & 0xFFFFFF
+        self._paint_settings_icon()
         self._sync_send_hint()
         if save:
             self.cfg["send_color"] = self.send_color
@@ -1626,12 +1582,24 @@ class FloatingWindow(QWidget):
         if menu is not None:
             menu.close()
 
+    def _paint_settings_icon(self) -> None:
+        """「设置」按钮左侧那个小方块就是当前颜色，不展开也看得见。"""
+        pixmap = QPixmap(12, 12)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(f"#{self.send_color:06x}"))
+        painter.setPen(QColor("#8a93a3"))
+        painter.drawRoundedRect(0, 0, 12, 12, 3, 3)
+        painter.end()
+        self.send_settings_btn.setIcon(QIcon(pixmap))
+
     def _sync_send_hint(self) -> None:
         """颜色和位置都收进下拉了，至少让按钮的悬停提示能看见当前值。"""
         mode = {m: label for label, m in self._mode_choices()}.get(self._send_mode(), "")
         extra = f"颜色 #{self.send_color:06x}" + (f" · 位置 {mode}" if mode else "")
         self.send_btn.setToolTip(f"{self._send_hint()}\n{extra}")
-        self.send_more.setToolTip(f"弹幕颜色与位置\n{extra}")
+        self.send_settings_btn.setToolTip(f"弹幕颜色与位置\n{extra}")
 
     @staticmethod
     def _menu_label(text: str, name: str) -> QLabel:
@@ -1775,10 +1743,11 @@ class FloatingWindow(QWidget):
 
     def _open_send_options(self) -> None:
         menu = self._build_send_menu()
-        # 贴在「▾」正下方、右侧对齐：面板比按钮宽，往左伸才不会跑出屏幕
+        # 贴在「设置」按钮正下方、左侧对齐（面板比按钮宽，往右伸没关系，
+        # 靠屏幕右缘时 Qt 会自己往里挪）
         menu.exec(
-            self.send_more.mapToGlobal(
-                QPoint(self.send_more.width() - menu.width(), self.send_more.height() + 4)
+            self.send_settings_btn.mapToGlobal(
+                QPoint(0, self.send_settings_btn.height() + 4)
             )
         )
 
@@ -2032,9 +2001,11 @@ class FloatingWindow(QWidget):
         else:
             placeholder = f"在这发弹幕，Enter 发送（最多 {SEND_MAX_LEN} 字）"
         self.send_input.setPlaceholderText(placeholder)
-        for widget in (self.send_input, self.emote_btn, self.send_more):
+        for widget in (self.send_input, self.emote_btn, self.send_settings_btn):
             widget.setEnabled(ready)
         self.send_btn.setEnabled(ready and not busy)
+        # 点赞也要房间和账号；同一时刻只允许一次在飞
+        self.like_btn.setEnabled(ready and self._like_future is None)
         self._sync_send_hint()
         self.send_input.setToolTip(self._send_hint())
 
@@ -2153,6 +2124,56 @@ class FloatingWindow(QWidget):
                 self._append_sys(f"已发送{note}：{payload}")
         else:
             self._append_sys(f"发送失败：{payload}")
+
+    # ----- 点赞 -----
+
+    def _on_like(self) -> None:
+        if self._like_future is not None:
+            return
+        if self._test_mode:
+            self._append_sys("0 号直播间是本地测试：点赞不会发到 B 站")
+            return
+        room = self._send_room()
+        if not room:
+            self._append_sys("点赞失败：还没有连上任何直播间")
+            return
+        self.like_btn.setEnabled(False)
+        self.like_btn.setText("点赞中…")
+        self._like_future = self._like_pool.submit(
+            self._like_worker, room, int(self.state.anchor_uid or 0)
+        )
+
+    def _like_worker(self, room: int, anchor_uid: int) -> tuple[bool, str]:
+        """后台点赞，不碰界面。"""
+        try:
+            self.sender.like(room, anchor_uid)
+            return True, ""
+        except SendError as exc:
+            return False, str(exc)
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _poll_like(self) -> None:
+        if self._like_future is None or not self._like_future.done():
+            return
+        future, self._like_future = self._like_future, None
+        try:
+            ok, info = future.result()
+        except Exception as exc:  # noqa: BLE001 - worker 之外的意外
+            ok, info = False, f"{type(exc).__name__}: {exc}"
+
+        self.like_btn.setText("点赞")
+        self._refresh_send_state()
+        if ok:
+            # 不刷系统消息：点赞是高频操作，按钮给个「已赞」就够
+            self._like_count += 1
+            self.like_btn.setText("已赞")
+            self.like_btn.setToolTip(
+                f"给这个直播间点赞（这次连上后已点 {self._like_count} 次）"
+            )
+            QTimer.singleShot(1200, lambda: self.like_btn.setText("点赞"))
+        else:
+            self._append_sys(f"点赞失败：{info}")
 
     def _build_danmaku_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -3026,6 +3047,7 @@ class FloatingWindow(QWidget):
 
     def _tick(self) -> None:
         self._poll_send()
+        self._poll_like()
         self._poll_room_context()
         self._poll_account_meta()
         self._poll_medals()
@@ -3059,6 +3081,8 @@ class FloatingWindow(QWidget):
                 room_no = int(event.get("room_id") or 0)
                 self.state.real_room = room_no
                 self.state.title = event.get("title") or ""
+                self.state.anchor_uid = int(event.get("anchor_uid") or 0)
+                self._like_count = 0
                 self.title_label.setText(
                     self.state.title or TITLE
                     if room_no
@@ -3616,6 +3640,7 @@ class FloatingWindow(QWidget):
         self._images.stop()
         self._emote_images.stop()
         self._send_pool.shutdown(wait=False)
+        self._like_pool.shutdown(wait=False, cancel_futures=True)
         self._emote_pool.shutdown(wait=False, cancel_futures=True)
         self._account_pool.shutdown(wait=False, cancel_futures=True)
         self._avatar_images.stop()
