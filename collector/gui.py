@@ -1256,14 +1256,15 @@ class FloatingWindow(QWidget):
         row.addWidget(self.emote_btn)
 
         # 发送和它右边的「▾」拼成一个按钮：颜色、位置都收进这个下拉，
-        # 窄窗口下能省出原来色块 + 位置下拉占的两格
+        # 窄窗口下能省出原来色块 + 位置下拉占的两格。
+        # 两个按钮装进零间距容器，再整体放进发送行——发送行的统一间距
+        # 会把它们的缝拉开，看起来就成了两个按钮
         self.send_btn = QPushButton("发送")
         self.send_btn.setObjectName("primary")
         self.send_btn.setProperty("joined", "left")
         self.send_btn.setProperty("active", "false")
         self.send_btn.clicked.connect(self._on_send)
         self.send_btn.setToolTip(self._send_hint())
-        row.addWidget(self.send_btn)
 
         self.send_more = QPushButton("▾")
         self.send_more.setObjectName("sendmore")
@@ -1271,7 +1272,14 @@ class FloatingWindow(QWidget):
         self.send_more.setCursor(Qt.PointingHandCursor)
         self.send_more.setToolTip("弹幕颜色与位置")
         self.send_more.clicked.connect(self._open_send_options)
-        row.addWidget(self.send_more)
+
+        send_group = QWidget()
+        send_lay = QHBoxLayout(send_group)
+        send_lay.setContentsMargins(0, 0, 0, 0)
+        send_lay.setSpacing(0)
+        send_lay.addWidget(self.send_btn)
+        send_lay.addWidget(self.send_more)
+        row.addWidget(send_group)
         return row
 
     # ----- 账号 -----
