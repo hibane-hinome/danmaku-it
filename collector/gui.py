@@ -83,6 +83,10 @@ EMOTICON_PANEL_W = (
     + 2                                      # 取整余量
 )
 EMOTICON_PANEL_H = 268
+# 标题滚动的下限：再窄就只剩几个字在爬，不如把地方让给右边几个按钮
+MARQUEE_MIN_WIDTH = 64
+# 窗口窄于这个宽度时，「在线 / 舰长」从房间号那一行挪到账号下面一行
+STAT_INLINE_WIDTH = 430
 
 
 # ---------------- config helpers ----------------
@@ -794,6 +798,87 @@ class ComboArrowFollower(QObject):
         return False
 
 
+class MarqueeLabel(QWidget):
+    """标题：装得下就正常显示，装不下就横向慢慢滚。
+
+    QLabel 自己不会滚，所以外面套一层当裁切窗口，里面的 label 按时钟平移。
+    内层 label 仍然叫 ``title``，字号/颜色继续交给 QSS 的 ``QLabel#title``。
+    """
+
+    SPEED_PX_PER_SEC = 26.0
+    GAP_PX = 36          # 滚完一轮空多远再从头来
+    INTERVAL_MS = 33
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._label = QLabel(text, self)
+        self._label.setObjectName("title")
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._offset = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._advance)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumWidth(MARQUEE_MIN_WIDTH)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    # 外面只当 QLabel 用：改文字、读文字
+    def text(self) -> str:
+        return self._label.text()
+
+    def setText(self, text: str) -> None:
+        if self._label.text() == text:
+            return
+        self._label.setText(text)
+        self._offset = 0.0
+        self._relayout()
+        self._sync_timer()
+
+    def sizeHint(self) -> QSize:
+        height = self._label.sizeHint().height()
+        return QSize(240, max(height, self.fontMetrics().height() + 6))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._relayout()
+        self._sync_timer()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._relayout()
+        self._sync_timer()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()
+
+    def _text_width(self) -> int:
+        return self._label.sizeHint().width()
+
+    def _relayout(self) -> None:
+        height = max(self.height(), self.sizeHint().height())
+        self._label.resize(self._text_width(), height)
+        self._label.move(-round(self._offset), 0)
+
+    def _overflow(self) -> bool:
+        return self._text_width() > self.width()
+
+    def _sync_timer(self) -> None:
+        if self._overflow() and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._offset = 0.0
+            self._label.move(0, 0)
+
+    def _advance(self) -> None:
+        self._offset += self.SPEED_PX_PER_SEC * self.INTERVAL_MS / 1000
+        loop = self._text_width() + self.GAP_PX
+        if loop > 0 and self._offset >= loop:
+            self._offset = 0.0
+        self._label.move(-round(self._offset), 0)
+
+
 class PaneDragHandle(QObject):
     """Drag handle that moves a whole pane up or down inside the splitter."""
 
@@ -903,6 +988,8 @@ class FloatingWindow(QWidget):
         # 窗口尺寸落盘：还原完成前不许写，免得启动时的 resize 把旧值冲掉
         self._geo_ready = False
         self._geo_timer: QTimer | None = None
+        # 「在线 / 舰长」现在挂在房间号那一行，窄窗口时挪到账号下面一行
+        self._stat_inline = False
 
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
@@ -1068,7 +1155,7 @@ class FloatingWindow(QWidget):
         root.addLayout(self._build_header())
         root.addLayout(self._build_control_row())
         # 账号和粉丝牌放在列表上方：先定「谁在发」，再看内容
-        root.addLayout(self._build_identity_row())
+        root.addLayout(self._build_identity_block())
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -1133,13 +1220,9 @@ class FloatingWindow(QWidget):
         self.dot.setObjectName("dead")
         header.addWidget(self.dot)
 
-        self.title_label = QLabel(TITLE)
-        self.title_label.setObjectName("title")
-        # 标题只是装饰：窗口拖窄时让它先让位，别把整行撑住（窄了会被藏起来）
-        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.title_label.setMinimumWidth(0)
-        header.addWidget(self.title_label)
-        header.addStretch(1)
+        # 标题装不下就自己滚，不再按宽度阈值藏起来
+        self.title_label = MarqueeLabel(TITLE)
+        header.addWidget(self.title_label, 1)
 
         self.pin_btn = QPushButton()
         self.pin_btn.setObjectName("ghost")
@@ -1162,6 +1245,19 @@ class FloatingWindow(QWidget):
         header.addWidget(self.close_btn)
         return header
 
+    def _build_identity_block(self) -> QVBoxLayout:
+        """账号 / 粉丝牌一行；窗口窄的时候「在线 / 舰长」跟在下面一行。"""
+        block = QVBoxLayout()
+        block.setContentsMargins(0, 0, 0, 0)
+        block.setSpacing(4)
+        block.addLayout(self._build_identity_row())
+        # 这一行平时是空的（空布局不占高度），只有窄窗口才把状态字挪进来
+        self._stat_row = QHBoxLayout()
+        self._stat_row.setContentsMargins(0, 0, 0, 0)
+        self._stat_row.setSpacing(5)
+        block.addLayout(self._stat_row)
+        return block
+
     def _build_identity_row(self) -> QHBoxLayout:
         """发送身份：用哪个账号发、戴哪个粉丝牌。"""
         row = QHBoxLayout()
@@ -1178,7 +1274,7 @@ class FloatingWindow(QWidget):
         # 两个下拉各占一半可用宽度：窗口宽时回到原来的尺寸（有 max 卡着），
         # 拖窄时按指数一起缩，不会把整行撑住
         self.account_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        row.addWidget(self.account_box, 1)
+        row.addWidget(self.account_box, 6)
         self.account_arrow = self._combo_arrow(self.account_box)
 
         self.medal_box = QComboBox()
@@ -1189,12 +1285,16 @@ class FloatingWindow(QWidget):
         )
         self.medal_box.currentIndexChanged.connect(self._on_medal_changed)
         self.medal_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        row.addWidget(self.medal_box, 1)
+        row.addWidget(self.medal_box, 6)
         self.medal_arrow = self._combo_arrow(self.medal_box)
 
         # 账号和牌子的状态都在构造完控件后才能填，这里先压一次，避免闪空下拉
         self._populate_accounts()
         self._fill_medal_box()
+        # 右边留白：窗口拖宽时两个下拉到上限就停住，靠这段把多余的宽度吃掉，
+        # 账号和牌子才不会一个贴左一个飘到中间。spacer 的 stretch 压得很低，
+        # 窄窗口时宽度还是优先给两个下拉
+        row.addStretch(1)
         return row
 
     def _combo_arrow(self, combo: QComboBox) -> QLabel:
@@ -2308,6 +2408,8 @@ class FloatingWindow(QWidget):
     def _build_control_row(self) -> QHBoxLayout:
         footer = QHBoxLayout()
         footer.setSpacing(6)
+        # 记住它：「在线 / 舰长」宽窗口在这一行，窄窗口要挪去账号下面
+        self._footer = footer
 
         self.room_input = QComboBox()
         self.room_input.setEditable(True)
@@ -2612,19 +2714,34 @@ class FloatingWindow(QWidget):
         self._queue_geometry_save()
 
     def _sync_compact_chrome(self) -> None:
-        """窄窗口下收起「标题」「在线/舰长」这两个纯装饰文字。
+        """窄窗口下把「在线 / 舰长」挪到账号下面一行。
 
-        它们都有 sizePolicy=Ignored，本来就不会卡住布局；这里再按阈值藏掉，
-        是为了避免出现被裁掉一半的半截字。
+        标题不再按宽度藏起来了：装不下会自己滚（见 MarqueeLabel）。
         """
-        width = self.width()
-        for name, limit in (("title_label", 470), ("stat_label", 430)):
-            widget = getattr(self, name, None)
-            if widget is None:
-                continue
-            want = width >= limit
-            if widget.isHidden() == want:
-                widget.setVisible(want)
+        self._place_stat_label(self.width() < STAT_INLINE_WIDTH)
+
+    def _place_stat_label(self, inline: bool) -> None:
+        """把状态字在「房间号那一行右侧」和「账号下面一行」之间搬。
+
+        QLabel 只能待在一个布局里，所以是 remove + add；两边都 setAlignment，
+        免得在窄行里被 Ignored 策略压成 0 宽。
+        """
+        if inline == self._stat_inline:
+            return
+        self._stat_inline = inline
+        if inline:
+            self._footer.removeWidget(self.stat_label)
+            self.stat_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            self.stat_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self._stat_row.addWidget(self.stat_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            self._stat_row.addStretch(1)
+        else:
+            self._stat_row.removeWidget(self.stat_label)
+            while self._stat_row.count():
+                self._stat_row.takeAt(0)
+            self.stat_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.stat_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self._footer.addWidget(self.stat_label, 1)
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
