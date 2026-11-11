@@ -10,6 +10,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,8 +18,8 @@ from string import Template
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImage, QPainter,
-    QPixmap,
+    QAction, QActionGroup, QBrush, QColor, QCursor, QDesktopServices, QGuiApplication, QIcon,
+    QImage, QPainter, QPixmap,
     QTextBlockUserData, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -56,8 +57,19 @@ EMOTE_PX = 20
 EMOTE_BIG_PX = 40
 # 正文里的表情占位：[名字]（老式小表情、收藏集表情都写成这样）
 EMOTE_TOKEN = re.compile(r"\[([^\[\]\s][^\[\]]{0,31})\]")
-# 透明悬浮：底板不透明度 0–100，0 = 连底板都没有，只剩字
+# 透明悬浮：遮罩浓度 0–100。
+# pill 模式是「每行文字底色的浓度」，bare 模式是「整块底板的浓度」，0 = 什么都不画
 OVERLAY_ALPHA = 45
+# 显示模式：整块底板 / 只给每行文字铺底（窗口其余地方全透明）/ 只剩字
+OVERLAY_MODES = (
+    ("solid", "常规 · 整块底板"),
+    ("pill", "贴片 · 只给文字铺底"),
+    ("bare", "仅弹幕 · 不留控件"),
+)
+OVERLAY_MODE_KEYS = tuple(key for key, _ in OVERLAY_MODES)
+# 贴片模式下，顶栏那排按钮自己的底色浓度（固定值，跟遮罩浓度解耦：
+# 浓度调到 0 时字都没底了，按钮还得能看见）
+PILL_BUTTON_ALPHA = 168
 # 账号下拉里的头像边长（取 2 倍再缩，缩放后更干净）
 AVATAR_PX = 18
 # 表情面板：按钮尺寸、每行几个、面板宽高
@@ -320,7 +332,13 @@ QPushButton:hover { background: rgba(255, 255, 255, 32); }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
-QPushButton#ghost { background: transparent; border: none; color: #9aa3b2; padding: 4px 8px; }
+QPushButton#ghost {
+    background: $ghost_bg;
+    border: none;
+    border-radius: 7px;
+    color: #9aa3b2;
+    padding: 4px 8px;
+}
 QPushButton#ghost:hover { color: #ffffff; }
 QPushButton#ghost:checked {
     background: rgba(47, 111, 237, 58);
@@ -343,8 +361,8 @@ QLineEdit:disabled, QComboBox:disabled {
 QComboBox QLineEdit:disabled { color: #5d6878; background: transparent; border: none; }
 QCheckBox { color: #c3c8d1; font-size: 11px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: #3a414d; border-radius: 4px; min-height: 24px; }
-QScrollBar::handle:vertical:hover { background: #4b5462; }
+QScrollBar::handle:vertical { background: $scroll_handle; border-radius: 4px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: $scroll_handle_hi; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """
@@ -423,7 +441,13 @@ QPushButton:pressed { background: #e6ebf2; }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #c0392b; }
-QPushButton#ghost { background: transparent; border: none; color: #6b7280; padding: 4px 8px; }
+QPushButton#ghost {
+    background: $ghost_bg;
+    border: none;
+    border-radius: 7px;
+    color: #6b7280;
+    padding: 4px 8px;
+}
 QPushButton#ghost:hover { color: #111827; background: #eef1f5; border-radius: 6px; }
 QPushButton#ghost:checked {
     background: #dfe9ff;
@@ -448,7 +472,7 @@ QLineEdit:disabled, QComboBox:disabled {
 QComboBox QLineEdit:disabled { color: #a8b0bd; background: transparent; border: none; }
 QCheckBox { color: #374151; font-size: 11px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: #c7ced8; border-radius: 4px; min-height: 24px; }
+QScrollBar::handle:vertical { background: $scroll_handle; border-radius: 4px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: #aab3c0; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
@@ -856,6 +880,9 @@ class FloatingWindow(QWidget):
         self._emoticon_panel: EmoticonPanel | None = None
         self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
+        # 最近这些行的原始数据：切显示模式时整表重排一遍，不能让上下两截样式不一样
+        self._danmaku_rows: deque[dict] = deque(maxlen=MAX_DANMAKU_BLOCKS)
+        self._event_lines: deque[tuple] = deque(maxlen=MAX_EVENT_BLOCKS)
         self._pending_images = 0
         self._drag_origin: QPoint | None = None
         self._dropped = 0
@@ -868,9 +895,10 @@ class FloatingWindow(QWidget):
         self._mock_stop: threading.Event | None = None
         # 0 号直播间：本地回放 + 本地回显发送，用来调试发送行
         self._test_mode = False
-        # 透明悬浮：底板是否隐去、以及拖窗时的起点
+        # 显示模式 solid/pill/bare；_overlay 只是「现在是否浮在画面上」的快捷判断
         self._overlay = False
         self._overlay_drag: QPoint | None = None
+        self._last_overlay_mode = "pill"
         # 表情名 → (图地址, 高度)：本房间表情包的那一份，包列表换了才重建
         self._emote_index_src: list[dict] | None = None
         self._emote_index: dict[str, tuple[str, int]] = {}
@@ -895,8 +923,8 @@ class FloatingWindow(QWidget):
         self._restore_layout()
         self._restore_panes()
         self._restore_geometry()
-        # 上次是透明模式就照旧，不必每次启动都手动点一次
-        self._set_overlay(bool(self.cfg.get("overlay")), persist=False)
+        # 上次是什么显示模式就照旧，不必每次启动都手动点一次
+        self._set_mode(self.overlay_mode(), persist=False)
         # 昵称/头像走后台，别让启动等网络
         self._request_account_meta()
 
@@ -934,6 +962,15 @@ class FloatingWindow(QWidget):
             self.theme = theme
         self._c = THEME_COLORS[self.theme]
         colors = self._c
+        # 模式以 cfg 为准：设置面板、右键菜单改完只要重刷一次样式就能跟上
+        self._overlay = self.overlay_mode() != "solid"
+        if self._overlay:
+            self._last_overlay_mode = self.overlay_mode()
+        if hasattr(self, "overlay_btn"):
+            self.overlay_btn.blockSignals(True)
+            self.overlay_btn.setChecked(self._overlay)
+            self.overlay_btn.blockSignals(False)
+            self.overlay_btn.setText("常规" if self._overlay else "透明")
 
         self.setStyleSheet(self._stylesheet())
         self.splitter.setStyleSheet(
@@ -991,12 +1028,19 @@ class FloatingWindow(QWidget):
             return OVERLAY_ALPHA
 
     def _panel_palette(self) -> dict[str, str]:
-        """底板、内容区、投影这几个颜色是随「透明模式 + 不透明度」变的。
+        """底板、内容区、投影这几个颜色是随「显示模式 + 浓度」变的。
 
         QSS 是一整块字符串，没法在运行时改单条规则，所以做成模板再填。
         """
         dark = self.theme == "dark"
-        if not self._overlay:
+        mode = self.overlay_mode()
+        # 浮在画面上时滚动条也压淡：一条实心深灰竖在画面边上太扎眼
+        scroll = (
+            ("#3a414d", "#4b5462")
+            if dark
+            else ("#c7ced8", "#d5dbe4")
+        ) if mode == "solid" else ("rgba(150, 158, 172, 120)", "rgba(170, 178, 192, 170)")
+        if mode == "solid":
             return {
                 "panel_bg": "rgba(24, 26, 30, 242)" if dark else "#f7f8fa",
                 "panel_border": (
@@ -1005,11 +1049,29 @@ class FloatingWindow(QWidget):
                 "panel_radius": "14px" if dark else "10px",
                 "view_bg": "rgba(14, 15, 18, 200)" if dark else "#ffffff",
                 "view_border": "none" if dark else "1px solid #e3e7ee",
+                "ghost_bg": "transparent",
+                "scroll_handle": scroll[0],
+                "scroll_handle_hi": scroll[1],
             }
 
         level = round(self._overlay_alpha() * 255 / 100)
         rgb = "8, 9, 11" if dark else "247, 248, 250"
-        # 完全不透明 = 只有字：连描边都不留，否则桌上会多出一圈细线
+        if mode == "pill":
+            # 贴片：窗口整块不画底，透明的地方是真的透明；底色挪到每行文字
+            # 自己去铺（见 _text_pill），顶栏按钮各带一小块底才看得见
+            return {
+                "panel_bg": "transparent",
+                "panel_border": "none",
+                "panel_radius": "0px",
+                "view_bg": "transparent",
+                "view_border": "none",
+                "ghost_bg": f"rgba({rgb}, {PILL_BUTTON_ALPHA})" if dark
+                else "rgba(255, 255, 255, 214)",
+                "scroll_handle": scroll[0],
+                "scroll_handle_hi": scroll[1],
+            }
+
+        # bare：只剩字，连描边都不留，否则桌面上会多出一圈细线
         border = "none" if level == 0 else (
             "1px solid rgba(255, 255, 255, 18)" if dark else "1px solid rgba(15, 23, 42, 26)"
         )
@@ -1019,14 +1081,47 @@ class FloatingWindow(QWidget):
             "panel_radius": "0px",
             "view_bg": "transparent",
             "view_border": "none",
+            "ghost_bg": "transparent",
+            "scroll_handle": scroll[0],
+            "scroll_handle_hi": scroll[1],
         }
+
+    def overlay_mode(self) -> str:
+        """当前显示模式。老配置只有 overlay 布尔值，按「贴片」算升级。"""
+        mode = str(self.cfg.get("overlay_mode") or "")
+        if mode in OVERLAY_MODE_KEYS:
+            return mode
+        return "pill" if self.cfg.get("overlay") else "solid"
+
+    def _pill_mode(self) -> bool:
+        return self.overlay_mode() == "pill"
+
+    def _pill_bg(self) -> str:
+        """每行文字铺底用的背景色；浓度 0 时不铺。"""
+        if self._overlay_alpha() <= 0:
+            return "transparent"
+        rgb = "8, 9, 11" if self.theme == "dark" else "247, 248, 250"
+        return f"rgba({rgb}, {round(self._overlay_alpha() * 255 / 100)})"
+
+    def _text_pill(self, line: str) -> str:
+        """给一行已经排好的富文本套一层半透明底，宽度只跟着文字走。
+
+        QTextDocument 里块是整行宽的，只有行内 span 的背景才贴着字，
+        所以「不遮挡画面」靠的就是这一层——窗口本身不画任何底色。
+        """
+        if not self._pill_mode():
+            return line
+        bg = self._pill_bg()
+        if bg == "transparent":
+            return line
+        return f'<span style="background-color:{bg}">&nbsp;{line}&nbsp;</span>'
 
     def _stylesheet(self) -> str:
         template = DARK_STYLE if self.theme == "dark" else LIGHT_STYLE
         return Template(template).substitute(self._panel_palette())
 
-    def _chrome_widgets(self) -> list[QWidget]:
-        """透明模式下要收起来的一整套操作控件（只留弹幕正文）。"""
+    def _chrome_widgets(self) -> list[tuple[str, QWidget]]:
+        """窗口里那些「操作控件」：浮到画面上时按模式决定留哪几个。"""
         names = (
             "dot", "title_label", "overlay_btn", "pin_btn", "settings_btn", "close_btn",
             "room_input", "room_arrow", "connect_btn", "pane_btn", "stat_label",
@@ -1034,45 +1129,89 @@ class FloatingWindow(QWidget):
             "send_input", "emote_btn", "color_btn", "mode_box", "mode_arrow", "send_btn",
             "grip", "danmaku_title", "event_title", "sc_title",
         )
-        widgets = [getattr(self, name, None) for name in names]
-        widgets.extend(self._drag_handles.values())
-        widgets.extend(getattr(self, "event_filters", {}).values())
-        return [widget for widget in widgets if widget is not None]
+        out: list[tuple[str, QWidget]] = []
+        for name in names:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                out.append((name, widget))
+        out.extend((f"drag:{key}", item) for key, item in self._drag_handles.items())
+        out.extend((f"filter:{key}", item) for key, item in getattr(self, "event_filters", {}).items())
+        return out
+
+    def _set_mode(self, mode: str, persist: bool = True) -> None:
+        """切换显示模式：solid 常规 / pill 贴片 / bare 仅弹幕。
+
+        贴片是把底色从「整块窗口」挪到「每行文字」，窗口本身完全透明，
+        所以画面不被一块矩形遮住；顶栏的几个按钮仍然留着，随时能点回来。
+        """
+        if mode not in OVERLAY_MODE_KEYS:
+            mode = "solid"
+        changed = mode != self.overlay_mode()
+        self.cfg["overlay_mode"] = mode
+        # 旧版只认布尔值，顺手留一份，回退到旧版本时不至于直接黑着
+        self.cfg["overlay"] = mode != "solid"
+        if mode != "solid":
+            self._last_overlay_mode = mode
+        self._overlay_drag = None
+        # 按钮自己就是出口：在浮层里显示「常规」，在常规里显示「透明」
+        # （文案和勾选状态在 _apply_theme 里统一同步，这里不用管）
+        self._apply_theme(clear=False)
+        if changed:
+            # 屏上已有的那些行还带着旧样式的底色，重排一遍免得上下两截不一致
+            self._repaint_streams()
+        if persist:
+            self._save_config_quiet()
+        if changed:
+            if mode == "pill":
+                self._append_sys("贴片模式：底色只铺在文字上，画面不再被整块遮住；点「常规」恢复")
+            elif mode == "bare":
+                self._append_sys("仅弹幕：双击窗口或右键菜单退出，按住左键可以拖走")
+            else:
+                self._append_sys("已回到常规显示")
 
     def _set_overlay(self, on: bool, persist: bool = True) -> None:
-        """透明悬浮：底板隐去、操作控件收起，窗口只剩弹幕。
-
-        拖动/退出靠 ``OverlayMouseFilter``（双击退出、左键拖走），
-        右键菜单里也有「退出透明模式」。
-        """
-        on = bool(on)
-        if on == self._overlay:
-            return
-        self._overlay = on
-        self._overlay_drag = None
-        self.overlay_btn.blockSignals(True)
-        self.overlay_btn.setChecked(on)
-        self.overlay_btn.blockSignals(False)
-        self._apply_theme(clear=False)
-        if persist:
-            self.cfg["overlay"] = on
-            self._save_config_quiet()
+        """布尔入口：进浮层时用上次那档样式（默认贴片），退出就是常规。"""
         if on:
-            self._append_sys("透明模式：双击窗口或右键菜单退出，按住左键可以拖走")
+            self._set_mode(getattr(self, "_last_overlay_mode", "pill"), persist=persist)
+        else:
+            self._set_mode("solid", persist=persist)
 
     def _sync_chrome(self) -> None:
-        """按透明模式收起/放回操作控件，并把外边距让出来。"""
-        for widget in self._chrome_widgets():
-            widget.setVisible(not self._overlay)
-        margin = 0 if self._overlay else 10
+        """按模式收起/放回操作控件，并把外边距让出来。
+
+        pill 只留顶栏那几个按钮（它们自带一小块底，浮在画面上也看得清），
+        bare 一个不留；除此之外的输入框、发送栏一律收起来。
+        """
+        mode = self.overlay_mode()
+        keep = (
+            {"overlay_btn", "pin_btn", "settings_btn", "close_btn"}
+            if mode == "pill"
+            else set()
+        )
+        for name, widget in self._chrome_widgets():
+            widget.setVisible(mode != "bare" and (mode != "pill" or name in keep))
+        margin = 0 if mode != "solid" else 10
         self._outer.setContentsMargins(margin, margin, margin, margin)
+        if hasattr(self, "_root"):
+            # 叠在画面上时别让布局再往里缩一圈，弹幕能用满宽度；
+            # 顶上留 4px 给那排按钮一点呼吸
+            self._root.setContentsMargins(*(0, 4, 0, 0) if mode == "pill" else (12, 10, 12, 10))
+        # 只有弹幕栏是该看的；事件/SC 栏在浮层里既没标题也没内容，留着只是占地方
+        for key, pane in self._panes.items():
+            if mode == "pill":
+                pane.setVisible(key == "danmaku" and self._pane_visible.get(key, True))
+            else:
+                pane.setVisible(self._pane_visible.get(key, True))
 
     def _on_overlay_mouse(self, event) -> bool:
-        """透明模式下的鼠标：左键拖窗、双击退出。返回 True 表示吃掉这个事件。"""
+        """浮层里的鼠标：左键拖窗，仅弹幕模式下双击退出。
+
+        贴片模式顶栏还留着按钮，双击就还给「选词」，不抢。
+        """
         kind = event.type()
         if kind == QEvent.MouseButtonDblClick:
-            if event.button() == Qt.LeftButton:
-                self._set_overlay(False)
+            if event.button() == Qt.LeftButton and self.overlay_mode() == "bare":
+                self._set_mode("solid")
                 return True
             return False
         if kind == QEvent.MouseButtonPress:
@@ -1113,6 +1252,7 @@ class FloatingWindow(QWidget):
         root = QVBoxLayout(panel)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
+        self._root = root
 
         root.addLayout(self._build_header())
         root.addLayout(self._build_control_row())
@@ -1190,8 +1330,8 @@ class FloatingWindow(QWidget):
         # 固定宽度：勾上之后按钮会藏起来，宽度变来变去会让整行抖
         self.overlay_btn.setFixedWidth(46)
         self.overlay_btn.setToolTip(
-            "透明悬浮：去掉底板，只把弹幕留在画面上。\n"
-            "透明时双击窗口退出，按住左键可拖动，右键有菜单"
+            "浮在画面上：窗口不画整块底板，底色只铺在每行文字上，顶栏按钮留着。\n"
+            "右键菜单里可以在「常规 / 贴片 / 仅弹幕」之间换"
         )
         self.overlay_btn.clicked.connect(self._toggle_overlay)
         header.addWidget(self.overlay_btn)
@@ -1218,10 +1358,11 @@ class FloatingWindow(QWidget):
         return header
 
     def _toggle_overlay(self) -> None:
-        self._set_overlay(self.overlay_btn.isChecked())
-        if self._overlay:
-            # 按钮已经藏起来了，给个能看见的提示
-            self.overlay_btn.setToolTip("透明模式已开启")
+        """「透明 / 常规」按钮：进浮层时用上次那档样式，退出就是常规。"""
+        if self.overlay_btn.isChecked():
+            self._set_mode(getattr(self, "_last_overlay_mode", "pill"))
+        else:
+            self._set_mode("solid")
 
     def _build_identity_row(self) -> QHBoxLayout:
         """发送身份：用哪个账号发、戴哪个粉丝牌。"""
@@ -2203,13 +2344,24 @@ class FloatingWindow(QWidget):
                 lambda pos, v=view, h=handler: self._show_clear_menu(v, pos, h)
             )
 
+    def _add_mode_menu(self, menu: QMenu) -> None:
+        """右键菜单里的「显示模式」三选一。"""
+        sub = menu.addMenu("显示模式")
+        group = QActionGroup(sub)
+        group.setExclusive(True)
+        current = self.overlay_mode()
+        for key, label in OVERLAY_MODES:
+            action = sub.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key == current)
+            action.triggered.connect(lambda _checked=False, m=key: self._set_mode(m))
+            group.addAction(action)
+
     def _show_clear_menu(self, view: QTextBrowser, pos: QPoint, handler) -> None:
         menu = QMenu(view)
-        if self._overlay:
-            # 透明模式下左下角什么都没有了，右键是唯一的出口
-            menu.addAction("退出透明模式", lambda: self._set_overlay(False))
-            menu.addAction("设置…", self._open_settings)
-            menu.addSeparator()
+        self._add_mode_menu(menu)
+        menu.addAction("设置…", self._open_settings)
+        menu.addSeparator()
         copy_action = menu.addAction("复制", view.copy)
         copy_action.setEnabled(view.textCursor().hasSelection())
         menu.addSeparator()
@@ -2219,10 +2371,7 @@ class FloatingWindow(QWidget):
     def contextMenuEvent(self, event) -> None:
         """窗口空白处（透明模式下就是文字之间的缝）的右键菜单。"""
         menu = QMenu(self)
-        if self._overlay:
-            menu.addAction("退出透明模式", lambda: self._set_overlay(False))
-        else:
-            menu.addAction("进入透明模式", lambda: self._set_overlay(True))
+        self._add_mode_menu(menu)
         menu.addAction(
             "取消置顶" if self.pin_btn.isChecked() else "置顶",
             lambda: self._set_topmost(not self.pin_btn.isChecked()),
@@ -2239,6 +2388,7 @@ class FloatingWindow(QWidget):
 
     def _clear_danmaku(self) -> None:
         self.danmaku.clear()
+        self._danmaku_rows.clear()
         self._danmaku_pending.clear()
         self._pending_images = 0
         self.state.messages = 0
@@ -2247,8 +2397,29 @@ class FloatingWindow(QWidget):
 
     def _clear_events(self) -> None:
         self.event_view.clear()
+        self._event_lines.clear()
         self.state.gifts = 0
         self.state.enters = 0
+
+    def _repaint_streams(self) -> None:
+        """切显示模式后，把已经显示出来的内容按新样式重排一遍。
+
+        底色是拼在每一行自己的 HTML 里的（贴片模式），旧行不会跟着变；
+        重插一遍最省事，代价不过几百行富文本。
+        """
+        rows = list(self._danmaku_rows)
+        if rows:
+            self._danmaku_rows.clear()
+            self._danmaku_pending.clear()
+            self._pending_images = 0
+            self.danmaku.clear()
+            self._insert_danmaku(rows)
+        lines = list(self._event_lines)
+        if lines:
+            self._event_lines.clear()
+            self.event_view.clear()
+            for item in lines:
+                self._append_event_line(*item)
 
     def _clear_sc(self) -> None:
         self.sc_view.clear()
@@ -3142,6 +3313,7 @@ class FloatingWindow(QWidget):
         cursor.movePosition(QTextCursor.End)
         cursor.beginEditBlock()
         for row in rows:
+            self._danmaku_rows.append(row)
             urls = self._row_image_urls(row)
             for url in urls:
                 image = self._images.image(url)
@@ -3238,12 +3410,17 @@ class FloatingWindow(QWidget):
 
         非本人的行必须显式清掉底色：插入新块会继承上一块的格式，
         自己的那行后面要是跟着一条别人的弹幕，别人也会被染上。
+
+        贴片模式下不铺整行底——那会横贯整个窗口宽，正好把画面遮成一条条；
+        自己发的弹幕靠前缀的 ▌ 和字色区分就够了。
         """
         fmt = cursor.blockFormat()
-        if self._is_self_row(row):
+        if self._is_self_row(row) and not self._pill_mode():
             fmt.setBackground(QBrush(QColor(self._c["self_bg"])))
         else:
             fmt.clearBackground()
+        # 贴片模式下每行之间留一点缝，相邻两条的底色才不会粘成一整块
+        fmt.setBottomMargin(3 if self._pill_mode() else 0)
         cursor.setBlockFormat(fmt)
 
     def _text_html(self, row: dict) -> str:
@@ -3333,7 +3510,8 @@ class FloatingWindow(QWidget):
             parts.append(
                 f'<span style="color:{self._c["time"]}">[测试 #{color:06x} · {mode}]</span>'
             )
-        return " ".join(parts)
+        # 贴片模式：整行先套一层「跟着文字走」的半透明底，再塞进文档
+        return self._text_pill(" ".join(parts))
 
     def _open_profile(self, url: QUrl) -> None:
         QDesktopServices.openUrl(url)
@@ -3367,16 +3545,18 @@ class FloatingWindow(QWidget):
         scrollbar = view.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
 
+        self._event_lines.append((event_time, tag, color, text))
         cursor = QTextCursor(view.document())
         cursor.movePosition(QTextCursor.End)
         cursor.beginEditBlock()
         if cursor.position() > 0:
             cursor.insertBlock()
-        cursor.insertHtml(
+        line = (
             f'<span style="color:{self._c["time"]}">{stamp}</span> '
             f'<span style="color:{color}">[{html.escape(tag)}]</span> '
             f'<span style="color:{self._c["text"]}">{html.escape(text)}</span>'
         )
+        cursor.insertHtml(self._text_pill(line))
         cursor.endEditBlock()
 
         if at_bottom:
@@ -3642,16 +3822,28 @@ class SettingsPopup(QDialog):
         self.theme_box.setCurrentIndex(index if index >= 0 else 0)
         form.addRow("主题", self.theme_box)
 
+        self.mode_choice = QComboBox()
+        for key, label in OVERLAY_MODES:
+            self.mode_choice.addItem(label, key)
+        index = self.mode_choice.findData(owner.overlay_mode())
+        self.mode_choice.setCurrentIndex(index if index >= 0 else 0)
+        self.mode_choice.setToolTip(
+            "常规：整块底板，平时用这个。\n"
+            "贴片：窗口不画底，底色只铺在每行文字上，画面不被遮住，顶栏按钮留着。\n"
+            "仅弹幕：连按钮也收起来，双击窗口退出"
+        )
+        form.addRow("显示模式", self.mode_choice)
+
         self.overlay_alpha = QSpinBox()
         self.overlay_alpha.setRange(0, 100)
         self.overlay_alpha.setSingleStep(5)
         self.overlay_alpha.setSuffix(" %")
         self.overlay_alpha.setValue(int(cfg.get("overlay_alpha", OVERLAY_ALPHA)))
         self.overlay_alpha.setToolTip(
-            "只在透明模式下生效：底板的不透明度。\n"
-            "0% = 连底板都不画，桌面上只剩字；要退出透明模式双击窗口或右键"
+            "贴片模式下是每行文字底色的浓度，仅弹幕模式下是整块底板的浓度。\n"
+            "0% = 什么都不画，只剩字"
         )
-        form.addRow("透明底板不透明度", self.overlay_alpha)
+        form.addRow("遮罩浓度", self.overlay_alpha)
 
         self.cookie_dir = QLineEdit(str(cfg.get("cookie_dir", "")))
         self.cookie_dir.setPlaceholderText("放 cookie 文件的目录，可以放多个 csv，启动时自动扫描")
@@ -3793,6 +3985,7 @@ class SettingsPopup(QDialog):
             "cookie_dir": cookie_dir,
             "theme": theme,
             "overlay_alpha": self.overlay_alpha.value(),
+            "overlay_mode": str(self.mode_choice.currentData()),
         })
         owner.danmaku.document().setMaximumBlockCount(self.max_blocks.value())
         owner._reload_sender()
