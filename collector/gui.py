@@ -324,7 +324,9 @@ QPushButton:hover { background: rgba(255, 255, 255, 32); }
 QPushButton#primary { background: #2f6fed; border: none; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #3b7bf5; }
 QPushButton#primary[active="true"] { background: #b03a3a; }
-/* 发送按钮右侧的「▾」：跟发送同一个底色，拼成一个按钮，只多一条竖线 */
+/* 发送按钮右侧的「▾」：跟发送同一个底色，拼成一个按钮。
+   分隔线用独立的 1px 细线（见 _build_send_row），不能写成 border-left：
+   Qt 的四条边框宽度不一致时 border-radius 会直接失效，右边就成了直角 */
 QPushButton#primary[joined="left"] {
     border-top-right-radius: 0;
     border-bottom-right-radius: 0;
@@ -332,19 +334,16 @@ QPushButton#primary[joined="left"] {
 QPushButton#sendmore {
     background: #2f6fed;
     border: none;
-    border-left: 1px solid rgba(255, 255, 255, 78);
     color: white;
     padding: 0 3px;
     font-size: 10px;
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
+    border-top-right-radius: 7px;
+    border-bottom-right-radius: 7px;
 }
 QPushButton#sendmore:hover { background: #3b7bf5; }
-QPushButton#sendmore:disabled {
-    background: #2b3240;
-    color: #7d8797;
-    border-left-color: rgba(255, 255, 255, 22);
-}
+QPushButton#sendmore:disabled { background: #2b3240; color: #7d8797; }
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -461,19 +460,16 @@ QPushButton#primary[joined="left"] {
 QPushButton#sendmore {
     background: #2f6fed;
     border: none;
-    border-left: 1px solid rgba(255, 255, 255, 150);
     color: white;
     padding: 0 3px;
     font-size: 10px;
     border-top-left-radius: 0;
     border-bottom-left-radius: 0;
+    border-top-right-radius: 7px;
+    border-bottom-right-radius: 7px;
 }
 QPushButton#sendmore:hover { background: #3b7bf5; }
-QPushButton#sendmore:disabled {
-    background: #b9cdf3;
-    color: #ffffff;
-    border-left-color: rgba(255, 255, 255, 190);
-}
+QPushButton#sendmore:disabled { background: #b9cdf3; color: #ffffff; }
 QPushButton#ghost {
     background: $ghost_bg;
     border: none;
@@ -1024,6 +1020,14 @@ class FloatingWindow(QWidget):
         if hasattr(self, "send_btn"):
             self._refresh_send_state()
 
+        # 发送和「▾」之间的那根细线：跟着主题反着来，暗底上白线、亮底上黑线
+        if hasattr(self, "send_divider"):
+            self.send_divider.setStyleSheet(
+                "background: rgba(255, 255, 255, 92); border: none;"
+                if self.theme == "dark"
+                else "background: rgba(0, 0, 0, 52); border: none;"
+            )
+
 
     def _on_system_theme_changed(self, scheme) -> None:
         if str(self.cfg.get("theme", "dark")) != "system":
@@ -1269,6 +1273,9 @@ class FloatingWindow(QWidget):
         self.send_more = QPushButton("▾")
         self.send_more.setObjectName("sendmore")
         self.send_more.setFixedWidth(18)
+        # 按钮垂直方向默认是 Fixed：QSS 把 padding 去掉后 sizeHint 只有
+        # 10px 高，比发送按钮矮一截，也拼不出完整的圆角；改成跟着行拉伸
+        self.send_more.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.send_more.setCursor(Qt.PointingHandCursor)
         self.send_more.setToolTip("弹幕颜色与位置")
         self.send_more.clicked.connect(self._open_send_options)
@@ -1277,7 +1284,19 @@ class FloatingWindow(QWidget):
         send_lay = QHBoxLayout(send_group)
         send_lay.setContentsMargins(0, 0, 0, 0)
         send_lay.setSpacing(0)
+        # 分隔线是一根独立的 1px 细线，上下各缩 3px：写成 border-left 会让
+        # Qt 的 border-radius 失效（四边框宽不等就不画圆角）
+        self.send_divider = QFrame()
+        self.send_divider.setFixedWidth(1)
+        self.send_divider.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        divider_box = QWidget()
+        divider_lay = QVBoxLayout(divider_box)
+        divider_lay.setContentsMargins(0, 3, 0, 3)
+        divider_lay.setSpacing(0)
+        divider_lay.addWidget(self.send_divider)
+
         send_lay.addWidget(self.send_btn)
+        send_lay.addWidget(divider_box)
         send_lay.addWidget(self.send_more)
         row.addWidget(send_group)
         return row
