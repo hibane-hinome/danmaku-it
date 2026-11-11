@@ -410,10 +410,13 @@ class DanmakuSender:
         return self._wbi_api
 
     def like(self, room_id: int, anchor_id: int = 0, count: int = 1) -> dict:
-        """给直播间点赞，``count`` 是一次上报的个数（1–10）。
+        """给直播间点赞，``count`` 是这一次上报里包含的点赞次数（连击数）。
 
-        参数走 query（wts + w_rid 签名），csrf 传 bili_jct；body 是空的。
-        B 站对这个接口有每日上限，超了会回非 0 码，原样抛给界面显示。
+        ``click_time`` 不是一个点击一次：Bilibili-Evolved 点亮粉丝勋章就是
+        一次发 300，打卡 30 个直接发 30 即可。参数走 query（wts + w_rid 签名），
+        csrf 传 bili_jct；body 是空的。
+        B 站对这个接口有每日上限（单房间每天 3000 次），超了会回非 0 码，
+        原样抛给界面显示。
         """
         if not room_id:
             raise SendError("还没连上直播间，先点「连接」或填房间号")
@@ -427,7 +430,8 @@ class DanmakuSender:
                 raise SendError(info)
 
         params = {
-            "click_time": max(1, min(int(count), 10)),
+            # 单房间每天上限 3000 次，这里只做个防手滑的夹紧
+            "click_time": max(1, min(int(count), 3000)),
             "room_id": int(room_id),
             "uid": int(self.uid or 0),
             "anchor_id": int(anchor_id or 0),

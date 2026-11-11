@@ -62,6 +62,9 @@ EMOTE_TOKEN = re.compile(r"\[([^\[\]\s][^\[\]]{0,31})\]")
 WINDOW_OPACITY = 100
 # 下限：再淡就别想看清弹幕了，而且会找不到窗口
 WINDOW_OPACITY_MIN = 30
+# 亲密度打卡一次要 30 个赞。注意 click_time 是「这一次上报里点了几下」，
+# 不是一次点击，所以 30 个一把发出去就行，不用循环
+LIKE_BURST = 30
 # 账号下拉里的头像边长（取 2 倍再缩，缩放后更干净）
 AVATAR_PX = 18
 # 表情面板：按钮尺寸、每行几个、面板宽高
@@ -862,6 +865,8 @@ class FloatingWindow(QWidget):
         self._like_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="like")
         self._like_future: Future | None = None
         self._like_count = 0  # 这次连上之后点了多少个赞，只用来写在 tooltip 里
+        # 正在飞的那一次点的是哪个按钮、一共要几个（1 或 LIKE_BURST）
+        self._like_pending: tuple[QPushButton, int] | None = None
         self._mode_locked = False  # 房间只开放一种位置时锁死选择
         # 位置以前挂在下拉的 currentData 上，现在收进发送按钮的下拉，值自己存
         self._send_mode_value = int(self.cfg.get("send_mode", 1))
@@ -1230,9 +1235,19 @@ class FloatingWindow(QWidget):
         self.like_btn = QPushButton("点赞")
         self.like_btn.setObjectName("ghost")
         self.like_btn.setCursor(Qt.PointingHandCursor)
-        self.like_btn.setToolTip("给这个直播间点赞（每点一次 +1，B 站有每日上限）")
+        self.like_btn.setToolTip("给这个直播间点赞（+1，B 站有每日上限）")
         self.like_btn.clicked.connect(self._on_like)
         row.addWidget(self.like_btn)
+
+        # 亲密度打卡：一次 30 个。单独一个按钮，不用按住/长按，点一下就走
+        self.like_burst_btn = QPushButton(f"{LIKE_BURST} 赞")
+        self.like_burst_btn.setObjectName("ghost")
+        self.like_burst_btn.setCursor(Qt.PointingHandCursor)
+        self.like_burst_btn.setToolTip(
+            f"亲密度打卡：一次点 {LIKE_BURST} 个赞（一次上报，点满 30 个亲密度 +1）"
+        )
+        self.like_burst_btn.clicked.connect(self._on_like_burst)
+        row.addWidget(self.like_burst_btn)
 
         row.addStretch(1)
         return row
@@ -2004,8 +2019,10 @@ class FloatingWindow(QWidget):
         for widget in (self.send_input, self.emote_btn, self.send_settings_btn):
             widget.setEnabled(ready)
         self.send_btn.setEnabled(ready and not busy)
-        # 点赞也要房间和账号；同一时刻只允许一次在飞
-        self.like_btn.setEnabled(ready and self._like_future is None)
+        # 点赞也要房间和账号；同一时刻只允许一次在飞（1 个和 30 个共用一把锁）
+        busy_like = self._like_future is not None
+        self.like_btn.setEnabled(ready and not busy_like)
+        self.like_burst_btn.setEnabled(ready and not busy_like)
         self._sync_send_hint()
         self.send_input.setToolTip(self._send_hint())
 
@@ -2128,6 +2145,13 @@ class FloatingWindow(QWidget):
     # ----- 点赞 -----
 
     def _on_like(self) -> None:
+        self._start_like(1)
+
+    def _on_like_burst(self) -> None:
+        """亲密度打卡：一次 30 个赞。"""
+        self._start_like(LIKE_BURST)
+
+    def _start_like(self, total: int) -> None:
         if self._like_future is not None:
             return
         if self._test_mode:
@@ -2137,43 +2161,56 @@ class FloatingWindow(QWidget):
         if not room:
             self._append_sys("点赞失败：还没有连上任何直播间")
             return
+        button = self.like_btn if total <= 1 else self.like_burst_btn
+        self._like_pending = (button, total)
         self.like_btn.setEnabled(False)
-        self.like_btn.setText("点赞中…")
+        self.like_burst_btn.setEnabled(False)
+        button.setText("点赞中…")
         self._like_future = self._like_pool.submit(
-            self._like_worker, room, int(self.state.anchor_uid or 0)
+            self._like_worker, room, int(self.state.anchor_uid or 0), total
         )
 
-    def _like_worker(self, room: int, anchor_uid: int) -> tuple[bool, str]:
-        """后台点赞，不碰界面。"""
+    def _like_worker(self, room: int, anchor_uid: int, total: int = 1) -> tuple[bool, str, int]:
+        """后台点赞，不碰界面。返回 (是否成功, 错误信息, 实际打出去的个数)。"""
         try:
-            self.sender.like(room, anchor_uid)
-            return True, ""
+            self.sender.like(room, anchor_uid, total)
         except SendError as exc:
-            return False, str(exc)
+            return False, str(exc), 0
         except Exception as exc:  # noqa: BLE001 - 任何异常都要反馈到界面
-            return False, f"{type(exc).__name__}: {exc}"
+            return False, f"{type(exc).__name__}: {exc}", 0
+        return True, "", total
 
     def _poll_like(self) -> None:
         if self._like_future is None or not self._like_future.done():
             return
         future, self._like_future = self._like_future, None
+        button, total = self._like_pending or (self.like_btn, 1)
+        self._like_pending = None
         try:
-            ok, info = future.result()
+            ok, info, done = future.result()
         except Exception as exc:  # noqa: BLE001 - worker 之外的意外
-            ok, info = False, f"{type(exc).__name__}: {exc}"
+            ok, info, done = False, f"{type(exc).__name__}: {exc}", 0
 
-        self.like_btn.setText("点赞")
+        button.setText(f"{LIKE_BURST} 赞" if total > 1 else "点赞")
         self._refresh_send_state()
         if ok:
             # 不刷系统消息：点赞是高频操作，按钮给个「已赞」就够
-            self._like_count += 1
-            self.like_btn.setText("已赞")
-            self.like_btn.setToolTip(
-                f"给这个直播间点赞（这次连上后已点 {self._like_count} 次）"
+            self._like_count += done
+            button.setText("已打卡" if total > 1 else "已赞")
+            self._sync_like_hint()
+            QTimer.singleShot(
+                1200, lambda: button.setText(f"{LIKE_BURST} 赞" if total > 1 else "点赞")
             )
-            QTimer.singleShot(1200, lambda: self.like_btn.setText("点赞"))
         else:
             self._append_sys(f"点赞失败：{info}")
+
+    def _sync_like_hint(self) -> None:
+        self.like_btn.setToolTip(
+            f"给这个直播间点赞 +1（这次连上后已点 {self._like_count} 次）"
+        )
+        self.like_burst_btn.setToolTip(
+            f"亲密度打卡：一次点 {LIKE_BURST} 个赞（这次连上后已点 {self._like_count} 次）"
+        )
 
     def _build_danmaku_header(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -3083,6 +3120,7 @@ class FloatingWindow(QWidget):
                 self.state.title = event.get("title") or ""
                 self.state.anchor_uid = int(event.get("anchor_uid") or 0)
                 self._like_count = 0
+                self._sync_like_hint()
                 self.title_label.setText(
                     self.state.title or TITLE
                     if room_no
