@@ -1,3 +1,5 @@
 websockets>=13,<18
 brotli>=1.1.0
 PySide6-Essentials>=6.6
+# QtMultimedia（看直播窗口）在 Addons 里；不装也能用，只是「看直播」不可用
+PySide6-Addons>=6.6

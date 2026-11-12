@@ -972,6 +972,8 @@ class FloatingWindow(QWidget):
         self._emote_message = ""
         self._send_options: dict | None = None
         self._emoticon_panel: EmoticonPanel | None = None
+        # 看直播的播放窗口，第一次点按钮才创建
+        self._player = None
         self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
@@ -1053,6 +1055,10 @@ class FloatingWindow(QWidget):
         colors = self._c
 
         self.setStyleSheet(self._stylesheet())
+        player = getattr(self, "_player", None)
+        if player is not None:
+            player.theme = self.theme
+            player._apply_theme()
         self.splitter.setStyleSheet(
             f"QSplitter::handle {{ background: {colors['split']}; }}"
         )
@@ -2448,6 +2454,17 @@ class FloatingWindow(QWidget):
         self.connect_btn.clicked.connect(self._toggle_connect)
         footer.addWidget(self.connect_btn)
 
+        # 看直播：直接在应用里出画面，不开直播间网页（页面会被别人的爬虫记到）
+        self.player_btn = QPushButton("看直播")
+        self.player_btn.setObjectName("ghost")
+        self.player_btn.setCursor(Qt.PointingHandCursor)
+        self.player_btn.setToolTip(
+            "在单独的窗口里直接播这个房间的画面，不打开直播间网页——"
+            "网页会被各种第三方观众统计/盯播脚本抓到"
+        )
+        self.player_btn.clicked.connect(self._open_player)
+        footer.addWidget(self.player_btn)
+
         self.pane_btn = QPushButton("栏目")
         self.pane_btn.setObjectName("ghost")
         menu = QMenu(self.pane_btn)
@@ -2810,6 +2827,42 @@ class FloatingWindow(QWidget):
             self._disconnect()
         else:
             self._connect()
+
+    # ----- 看直播 -----
+
+    def _open_player(self) -> None:
+        """开一个独立的播放窗口，直接播直播间画面。
+
+        不跳浏览器是有原因的：直播间页面会被第三方观众统计、盯播脚本抓走，
+        等于对外宣布「这个人在看谁」。这里走官方取流接口自己解，不产生页面访问。
+        """
+        room = self.state.real_room or self._parse_room(self.room_input.currentText())
+        if not room:
+            self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
+            return
+        try:
+            from .live_player import LivePlayerWindow
+        except ImportError:
+            self._append_sys(
+                '看直播需要 PySide6-Addons（缺 QtMultimedia）：'
+                '在项目目录跑 pip install "PySide6-Addons>=6.6"'
+            )
+            return
+
+        win = getattr(self, "_player", None)
+        if win is None:
+            win = LivePlayerWindow(
+                self.sender, room, self.cfg, self.theme, self._save_config_quiet
+            )
+            self._player = win
+        else:
+            # 账号换了 cookie 就要换，房间换了要重新取流
+            win.set_sender(self.sender)
+            if win.room_id != room:
+                win.open_room(room)
+        win.show()
+        win.raise_()
+        win.activateWindow()
 
     def _fill_room_history(self, keep_text: str = "") -> None:
         history = [int(room) for room in (self.cfg.get("room_history") or [])]

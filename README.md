@@ -15,6 +15,11 @@
 - 界面把表情弹幕直接画成图片（地址来自报文的表情字段与 `extra.emots` 表），只在内存里流转，不落库
 - **能在弹幕机上直接发弹幕**，不用开直播间网页：底部输入框 + Enter 发送，限 80 字符、约 1 秒一条
   （采集和发送走同一个账号 cookie；缺 `bili_jct` 时用 SESSDATA 自动换一个）
+- **看直播也不用开网页**：控制行「看直播」在单独窗口直接播房间画面。走官方取流接口拿
+  HLS 地址，本地 `127.0.0.1` 小代理补 `Referer`/`UA`（B 站 CDN 要 referer，而 QMediaPlayer
+  没法加请求头），全程不产生直播间页面访问——页面会被第三方观众统计/盯播脚本抓到，等于
+  广播「我在看谁」。支持清晰度切换、暂停（再播自动接最新画面）、音量、全屏（F / Esc）、
+  断流自动重连；窗口位置大小会记住。需要 `PySide6-Addons`（装依赖时已带上）
 
 ## 依赖安装
 
@@ -28,7 +33,7 @@ cd D:\HibaneHinome\danmaku-it
 & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
 ```
 
-依赖：`websockets`、`brotli`、`PySide6-Essentials`（Qt 界面）。
+依赖：`websockets`、`brotli`、`PySide6-Essentials`（Qt 界面）、`PySide6-Addons`（看直播的 QtMultimedia；不装只是「看直播」按钮会提示缺依赖，其余功能不受影响）。
 
 ## 配置
 
