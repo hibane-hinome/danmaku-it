@@ -94,8 +94,8 @@ STAT_INLINE_WIDTH = 520
 # 弹幕栏自己的最小宽度：画面栏拉出来以后，右侧这一栏至少留这么宽，
 # 再窄账号行、发送区就挤成一团了（和窗口最小宽度 320 是同一个数）
 PANE_MIN_COLUMN = 320
-# 画面栏最小宽度：控制条上有连接/暂停/音量/清晰度/全屏，再窄按钮会互相压
-PANE_MIN_WIDTH = 300
+# 画面栏最小宽度：控制条上有连接/刷新/暂停/音量/清晰度/全屏，再窄按钮会互相压
+PANE_MIN_WIDTH = 372
 
 
 # ---------------- config helpers ----------------
@@ -1086,7 +1086,8 @@ class FloatingWindow(QWidget):
             f"QSplitter::handle {{ background: {colors['split']}; }}"
         )
         self._shell.setStyleSheet(
-            f"QSplitter::handle {{ background: {colors['split']}; }}"
+            "QSplitter::handle { background: transparent; }"
+            f"QSplitter::handle:hover {{ background: {colors['split']}; }}"
         )
         self._shadow.setColor(QColor(*colors["shadow"]))
         for arrow in (
@@ -1190,7 +1191,9 @@ class FloatingWindow(QWidget):
         # 画面栏是懒创建的，没点「看直播」之前这里只有右边一栏。
         shell = QSplitter(Qt.Horizontal, panel)
         shell.setChildrenCollapsible(False)
-        shell.setHandleWidth(6)
+        # 分隔条留出 12px 的呼吸位：handle 画成透明，露出来的是底板色，
+        # 于是画面栏的黑边和弹幕栏之间天然隔开一段，不再是两块贴在一起
+        shell.setHandleWidth(12)
         self._shell = shell
         panel_box = QVBoxLayout(panel)
         panel_box.setContentsMargins(12, 10, 12, 10)

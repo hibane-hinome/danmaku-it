@@ -418,7 +418,7 @@ class LivePlayerPane(QWidget):
         self._home_sizes: list[int] | None = None
 
         self.setObjectName("playerpane")
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(372)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self._build()
@@ -454,6 +454,13 @@ class LivePlayerPane(QWidget):
         self.connect_btn.clicked.connect(self._toggle_connect)
         row.addWidget(self.connect_btn)
 
+        # 刷新：重新取一次流。卡住、黑屏、刚开播都能按；没连的时候按就当连接
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.setToolTip("重新取一次流（卡住、黑屏、主播刚开播都可以按）")
+        self.refresh_btn.clicked.connect(self.refresh)
+        row.addWidget(self.refresh_btn)
+
         self.play_btn = QPushButton("暂停")
         self.play_btn.setCursor(Qt.PointingHandCursor)
         self.play_btn.setToolTip("直播不能倒回去，再播从最新画面接上")
@@ -463,7 +470,7 @@ class LivePlayerPane(QWidget):
         state = self._saved()
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
-        self.vol_slider.setFixedWidth(66)
+        self.vol_slider.setFixedWidth(58)
         self.vol_slider.setValue(max(0, min(100, int(state.get("vol", 80) or 0))))
         self.vol_slider.setToolTip("音量")
         self.vol_slider.valueChanged.connect(self._on_volume)
@@ -473,7 +480,7 @@ class LivePlayerPane(QWidget):
         self.qn_box = QComboBox()
         for _, label in QN_CHOICES:
             self.qn_box.addItem(label)
-        self.qn_box.setFixedWidth(62)
+        self.qn_box.setFixedWidth(58)
         self.qn_box.setToolTip("清晰度，切换会重新取一次流")
         try:
             qn_index = int(state.get("qn", 0) or 0)
@@ -483,7 +490,7 @@ class LivePlayerPane(QWidget):
         self.qn_box.currentIndexChanged.connect(self._on_quality)
         row.addWidget(self.qn_box)
 
-        self.status = QLabel("未连接")
+        self.status = QLabel("未连接 · 点「连接」开始")
         self.status.setObjectName("playerstatus")
         # 状态字只占零头：窄的时候先让位给按钮
         self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -558,8 +565,26 @@ class LivePlayerPane(QWidget):
     def is_streaming(self) -> bool:
         return self._active
 
-    def show_room(self, room_id: int, autoplay: bool = True) -> None:
-        """画面栏被拉开时叫一次：换房间就重取，没在播就顺手连上。"""
+    def refresh(self) -> None:
+        """重新取一次流：卡住、黑屏、主播刚开播都按这个。
+
+        没连的时候按等于「连接」——反正下一步都是取流，不如省一次点击。
+        """
+        if not self._active:
+            self.connect_stream()
+            return
+        self._retries = 0
+        self._stalled = 0
+        self._retry_timer.stop()
+        self.player.stop()
+        self._fetch()
+
+    def show_room(self, room_id: int, autoplay: bool = False) -> None:
+        """画面栏被拉开 / 换了房间时叫一次。
+
+        默认**不自动连**：拉开画面栏只准备地址，连不连由「连接」按钮说话。
+        正在播的时候换房间则直接换流，不算额外的自动播放。
+        """
         room = int(room_id or 0)
         if room and room != self.room_id:
             self.room_id = room
@@ -569,6 +594,8 @@ class LivePlayerPane(QWidget):
                 return
         if autoplay and not self._active:
             self.connect_stream(room)
+        elif not self._active:
+            self._set_status("未连接" if not self.room_id else f"未连接 · {self.room_id}")
 
     def set_sender(self, sender) -> None:
         """换账号：代理里存着 cookie，请求头得跟着换，所以代理整个重建。"""
