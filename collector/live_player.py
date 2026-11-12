@@ -424,6 +424,7 @@ class LivePlayerPane(QWidget):
     """
 
     state_changed = Signal(bool)  # True=正在播（含连接中），False=已断开
+    fullscreen_changed = Signal(bool)  # True=进了画面全屏，False=退出来了
 
     def __init__(
         self,
@@ -827,6 +828,8 @@ class LivePlayerPane(QWidget):
         QShortcut(QKeySequence("F"), host, activated=self._leave_full)
         host.showFullScreen()
         self.play_btn.setFocus()
+        # 主窗口是常驻置顶的，会一直压在全屏画面上面；叫它先让位
+        self.fullscreen_changed.emit(True)
 
     def _leave_full(self) -> None:
         host, self._full_host = self._full_host, None
@@ -843,6 +846,7 @@ class LivePlayerPane(QWidget):
         self.full_btn.setText("全屏")
         host.close()
         host.deleteLater()
+        self.fullscreen_changed.emit(False)
 
     # ----- 收尾 -----
 

@@ -96,6 +96,8 @@ STAT_INLINE_WIDTH = 520
 PANE_MIN_COLUMN = 320
 # 画面栏最小宽度：控制条上有连接/刷新/暂停/音量/清晰度/全屏，再窄按钮会互相压
 PANE_MIN_WIDTH = 372
+# 顶部多少像素算「标题区」：按住拖动窗口、双击最大化/还原都用这条线
+TITLE_DRAG_HEIGHT = 60
 
 
 # ---------------- config helpers ----------------
@@ -1028,6 +1030,13 @@ class FloatingWindow(QWidget):
         self._stat_inline = False
         # 账号行右边那段留白，窄窗口时摘掉
         self._identity_spacer_in = True
+        # 双击标题区最大化：_maximized 是当前状态，_normal_geo 是最大化前的大小位置
+        self._maximized = False
+        self._normal_geo: dict | None = None
+        # 画面栏全屏时主窗口先藏起来，这俩记着全屏前的几何和分隔条比例
+        self._in_player_full = False
+        self._full_geo: dict | None = None
+        self._full_split: list[int] | None = None
 
         self.setWindowTitle(TITLE)
         self.setWindowIcon(QIcon(ICON_PATH))
@@ -2829,6 +2838,9 @@ class FloatingWindow(QWidget):
         窗口要么被撑宽、要么整体左移，照当前值记就把弹幕机本来的宽度弄丢了），
         横向位置扣掉为自己撑开而挪的那一段，用户真挪了窗口也还算数。
         """
+        if self._maximized or self._in_player_full:
+            # 最大化/画面栏全屏期间的几何是临时的，别把正常时候的记录冲掉
+            return
         geo = {"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height()}
         pane = self._player_pane
         if pane is not None and pane.isVisible() and pane.width() > 0:
@@ -2953,8 +2965,61 @@ class FloatingWindow(QWidget):
         self.pin_btn.style().polish(self.pin_btn)
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton and event.position().y() < 60:
+        if event.button() == Qt.LeftButton and event.position().y() < TITLE_DRAG_HEIGHT:
+            # 最大化的时候按住标题一拖，先缩回原来的大小再跟着鼠标走
+            if self._maximized:
+                self._unmaximize(follow_cursor=event.globalPosition().toPoint())
             self._drag_origin = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        # 双击标题区：最大化 / 还原。按钮和输入框自己会吃掉双击，落不到这里
+        if event.button() == Qt.LeftButton and event.position().y() < TITLE_DRAG_HEIGHT:
+            self._toggle_maximize()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    # ----- 最大化 / 还原（无框窗口自己实现，不靠系统的最大化） -----
+
+    def _toggle_maximize(self) -> None:
+        if self._maximized:
+            self._unmaximize()
+        else:
+            self._maximize()
+
+    def _maximize(self) -> None:
+        if self._maximized:
+            return
+        self._normal_geo = {
+            "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height()
+        }
+        self._maximized = True
+        self.setGeometry(self._screen_area())
+
+    def _unmaximize(self, follow_cursor: QPoint | None = None) -> None:
+        if not self._maximized:
+            return
+        ratio = 0.0
+        if follow_cursor is not None:
+            # 光标按在标题的哪个比例上，缩回来以后还让它按在那个比例上，
+            # 这样拖拽的手感是连续的，窗口不会「跳」到光标另一头
+            ratio = min(1.0, max(0.0, (follow_cursor.x() - self.x()) / max(1, self.width())))
+        self._maximized = False
+        geo = self._normal_geo or {}
+        self._apply_window_geo(geo)
+        self._normal_geo = None
+        if follow_cursor is not None and geo.get("w"):
+            self.move(int(follow_cursor.x() - geo["w"] * ratio), follow_cursor.y())
+        if self._player_pane is not None and self._player_pane.isVisible():
+            self._sync_pane_shift()
+            QTimer.singleShot(0, lambda: self._apply_pane_sizes(self._pane_width()))
+
+    def _screen_area(self):
+        """窗口现在所在的屏幕（多显示器时最大化到原地，不跨屏乱跳）。"""
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = self.window().screen() or QGuiApplication.primaryScreen()
+        return screen.availableGeometry()
 
     def mouseMoveEvent(self, event) -> None:
         if self._drag_origin is not None and event.buttons() & Qt.LeftButton:
@@ -3013,6 +3078,7 @@ class FloatingWindow(QWidget):
         # 窗口变宽变窄都由右边的弹幕栏吸收，画面栏宽度靠拖分隔条自己定
         self._shell.setStretchFactor(0, 0)
         self._shell.setStretchFactor(1, 1)
+        pane.fullscreen_changed.connect(self._on_player_fullscreen)
         pane.hide()
         self._player_pane = pane
         return pane
@@ -3046,7 +3112,7 @@ class FloatingWindow(QWidget):
         need = self._pane_width()
         overhead = max(0, self.width() - self._shell.width())
         want_w = PANE_MIN_COLUMN + need + overhead
-        if self.width() < want_w:
+        if self.width() < want_w and not self._maximized:
             screen = QGuiApplication.screenAt(self.frameGeometry().center())
             if screen is None:
                 screen = QGuiApplication.primaryScreen()
@@ -3078,6 +3144,39 @@ class FloatingWindow(QWidget):
             self._sync_pane_shift()
             QTimer.singleShot(0, lambda: self._apply_pane_sizes(self._pane_width()))
 
+    def _on_player_fullscreen(self, on: bool) -> None:
+        """画面栏全屏时主窗口让位。
+
+        主窗口是常驻置顶的，会一直压在全屏画面上面；而且画面栏从分隔条里
+        被摘出去以后，弹幕栏会撑满整窗，看起来就像窗口「变回拉画面栏时
+        那么大」。所以进全屏先把自己藏起来，退出再原样回来。
+        """
+        if on:
+            self._in_player_full = True
+            self._full_geo = {
+                "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height()
+            }
+            self._full_split = list(self._shell.sizes())
+            if self._geo_timer is not None:
+                self._geo_timer.stop()
+            self.hide()
+            return
+        self._in_player_full = False
+        self.show()
+        geo = self._full_geo
+        if geo:
+            try:
+                self.setGeometry(int(geo["x"]), int(geo["y"]), int(geo["w"]), int(geo["h"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        self._full_geo = None
+        split = self._full_split
+        self._full_split = None
+        pane = self._player_pane
+        if split and pane is not None and pane.isVisible():
+            self._shell.setSizes(split)
+            self._sync_compact_chrome()
+
     def _sync_pane_shift(self) -> None:
         """记下「为了塞下画面栏，窗口比它本来该在的位置左移了多少」。"""
         plain = self.cfg.get("window")
@@ -3104,8 +3203,9 @@ class FloatingWindow(QWidget):
             pane.hide()
         self.cfg["player_open"] = False
         self.setMinimumWidth(PANE_MIN_COLUMN)
-        # 回到拉开画面栏之前那个尺寸和位置（别把分隔条那点宽度越攒越宽）
-        if not self._apply_window_geo(self.cfg.get("window")):
+        # 回到拉开画面栏之前那个尺寸和位置（别把分隔条那点宽度越攒越宽）；
+        # 最大化的时候窗口本来就是全屏那么大，别把它拽回小窗
+        if not self._maximized and not self._apply_window_geo(self.cfg.get("window")):
             # 没记过（第一次用这个功能）：把画面栏和分隔条的宽度减掉就行
             width = self.width() - (pane.width() if pane else 0) - self._shell.handleWidth()
             self.resize(max(PANE_MIN_COLUMN, width), self.height())
