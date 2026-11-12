@@ -3251,11 +3251,17 @@ class FloatingWindow(QWidget):
             pane.hide()
         self.cfg["player_open"] = False
         self.setMinimumWidth(PANE_MIN_COLUMN)
-        # 回到拉开画面栏之前那个尺寸和位置（别把分隔条那点宽度越攒越宽）；
-        # 最大化的时候窗口本来就是全屏那么大，别把它拽回小窗
-        if not self._maximized and not self._apply_window_geo(self.cfg.get("window")):
+        # 最大化的时候关画面，窗口跟着退回弹幕栏那一条：不然弹幕栏会撑满
+        # 整块屏幕（比拉开画面之前宽得多），看着就像「弹幕机自己被拉宽了」
+        if self._maximized:
+            self._maximized = False
+            self._normal_geo = None
+            self._sync_max_button()
+        # 回到拉开画面栏之前那个尺寸和位置（别把分隔条那点宽度越攒越宽）
+        if not self._apply_window_geo(self.cfg.get("window")):
             # 没记过（第一次用这个功能）：把画面栏和分隔条的宽度减掉就行
-            width = self.width() - (pane.width() if pane else 0) - self._shell.handleWidth()
+            width = self._column_keep or (self.width() - (pane.width() if pane else 0)
+                                          - self._shell.handleWidth())
             self.resize(max(PANE_MIN_COLUMN, width), self.height())
         self._save_config_quiet()
         self._set_player_button(False)
