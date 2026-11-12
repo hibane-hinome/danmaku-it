@@ -1002,6 +1002,8 @@ class FloatingWindow(QWidget):
         self._emoticon_panel: EmoticonPanel | None = None
         # 左侧的直播画面栏，第一次点「看直播」才创建
         self._player_pane = None
+        # 为塞下画面栏把窗口整体往左挪了多少，记窗口几何时要扣掉
+        self._pane_shift_x = 0
         self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
@@ -1037,11 +1039,14 @@ class FloatingWindow(QWidget):
         self.setMinimumSize(320, 540)
 
         self._build()
+        self._migrate_geometry()
         self._apply_theme(clear=False)
         self._restore_pane_order()
         self._restore_layout()
         self._restore_panes()
         self._restore_geometry()
+        # 上次退出时画面栏是开着的，等布局跑完照原样拉开
+        QTimer.singleShot(0, self._restore_player_state)
         # 窗口不透明度是持久化的，启动就按上次那个值来
         self._apply_opacity()
         # 昵称/头像走后台，别让启动等网络
@@ -2735,26 +2740,71 @@ class FloatingWindow(QWidget):
 
     # ----- window behaviour -----
 
-    def _restore_geometry(self) -> None:
-        geo = self.cfg.get("window")
-        if isinstance(geo, dict):
-            def _read(key: str) -> int | None:
-                try:
-                    return int(geo[key])
-                except (KeyError, TypeError, ValueError):
-                    return None
+    def _migrate_geometry(self) -> None:
+        """老配置的 ``window`` 记的是「画面栏开着时」的宽度，升级后拆成两份。
 
-            # 宽高和位置一起还原；老配置只有 x/y，那就只挪位置
-            width, height = _read("w"), _read("h")
-            if width and height:
-                self.resize(
-                    max(width, self.minimumWidth()), max(height, self.minimumHeight())
-                )
-            x, y = _read("x"), _read("y")
-            if x is not None and y is not None:
-                self.move(x, y)
-            self._clamp_to_screen()
+        只在第一次跑新版本时做一次（认 ``player_open`` 这个键在不在），
+        把宽得离谱的那份挪进 ``window_player``、``window`` 扣掉画面栏和分隔条。
+        """
+        if "player_open" in self.cfg:
+            return
+        geo = self.cfg.get("window")
+        try:
+            pane_w = int(self.cfg.get("player_pane_w") or 0)
+            width = int(geo.get("w") or 0) if isinstance(geo, dict) else 0
+        except (TypeError, ValueError):
+            pane_w = width = 0
+        if isinstance(geo, dict) and pane_w and width > pane_w + 200:
+            self.cfg["window_player"] = dict(geo)
+            self.cfg["window"] = {
+                "x": geo.get("x"),
+                "y": geo.get("y"),
+                "w": max(PANE_MIN_COLUMN, width - pane_w - self._shell.handleWidth()),
+                "h": geo.get("h"),
+            }
+        # 升级这第一次先按「画面栏没开着」启动，之后开没开都由用户自己定
+        self.cfg["player_open"] = False
+        self._save_config_quiet()
+
+    def _restore_geometry(self) -> None:
+        self._apply_window_geo(self.cfg.get("window"))
         self._geo_ready = True
+
+    def _keep_on_screen(self) -> None:
+        """右/下边超出屏幕就往里挪，别让画面栏一半露在屏幕外。"""
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        x, y = self.x(), self.y()
+        if x + self.width() - 1 > area.right():
+            x = area.right() - self.width() + 1
+        if y + self.height() - 1 > area.bottom():
+            y = area.bottom() - self.height() + 1
+        x = max(x, area.left())
+        y = max(y, area.top())
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
+
+    def _apply_window_geo(self, geo) -> bool:
+        """按配置里记的 x/y/w/h 摆窗口。挪到屏幕外的话先收回来，返回有没有动过。"""
+        if not isinstance(geo, dict):
+            return False
+        try:
+            width, height = int(geo["w"]), int(geo["h"])
+        except (KeyError, TypeError, ValueError):
+            width = height = 0
+        if width > 0 and height > 0:
+            self.resize(max(width, self.minimumWidth()), max(height, self.minimumHeight()))
+        try:
+            x, y = int(geo["x"]), int(geo["y"])
+        except (KeyError, TypeError, ValueError):
+            return width > 0 and height > 0
+        self.move(x, y)
+        self._clamp_to_screen()
+        return True
 
     def _clamp_to_screen(self) -> None:
         """上次的位置/尺寸可能落在已经拔掉的显示器上，收回到有画面的区域里。"""
@@ -2772,12 +2822,37 @@ class FloatingWindow(QWidget):
         self.move(x, y)
 
     def _store_geometry(self) -> None:
-        self.cfg["window"] = {
-            "x": self.x(),
-            "y": self.y(),
-            "w": self.width(),
-            "h": self.height(),
-        }
+        """记窗口几何。
+
+        画面栏开着的时候记两份：``window_player`` 是当前这个（含画面栏的）大小，
+        ``window`` 是「还没拉画面栏时」那一份——宽度保持拉开之前那个值（拉开时
+        窗口要么被撑宽、要么整体左移，照当前值记就把弹幕机本来的宽度弄丢了），
+        横向位置扣掉为自己撑开而挪的那一段，用户真挪了窗口也还算数。
+        """
+        geo = {"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height()}
+        pane = self._player_pane
+        if pane is not None and pane.isVisible() and pane.width() > 0:
+            self.cfg["window_player"] = dict(geo)
+            plain = self.cfg.get("window")
+            if isinstance(plain, dict) and plain.get("w"):
+                # 高度和上下位置画面栏不影响，跟着走；横向要扣掉「为塞下画面栏
+                # 而自己挪的那一段」，剩下的才是用户真的挪了多远；宽度保持原样
+                self.cfg["window"] = {
+                    "x": geo["x"] - self._pane_shift_x,
+                    "y": geo["y"],
+                    "w": plain["w"],
+                    "h": geo["h"],
+                }
+            else:
+                # 老配置没有这一份：只好按减法估一个
+                self.cfg["window"] = {
+                    "x": geo["x"],
+                    "y": geo["y"],
+                    "w": max(PANE_MIN_COLUMN, geo["w"] - pane.width() - self._shell.handleWidth()),
+                    "h": geo["h"],
+                }
+        else:
+            self.cfg["window"] = geo
         self._save_config_quiet()
 
     def _queue_geometry_save(self) -> None:
@@ -2942,15 +3017,20 @@ class FloatingWindow(QWidget):
         self._player_pane = pane
         return pane
 
-    def _show_player(self) -> None:
+    def _show_player(self, silent: bool = False) -> None:
         room = self._player_room()
         pane = self._ensure_player()
         if pane is None:
             self._set_player_button(False)
             return
 
+        # 先把「还没拉开画面栏」时的窗口几何记下来，收起时照着它回去
+        self._store_geometry()
+        self.cfg["player_open"] = True
+        self._save_config_quiet()
+
         live = self._danmaku_live()
-        if not room:
+        if not room and not silent:
             self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
         if self._test_mode:
             reason = "0 号测试房间没有直播画面"
@@ -2965,13 +3045,46 @@ class FloatingWindow(QWidget):
         # 外框（边距 + 边框）不算在分隔条里，得单独补上，否则右边那栏会被压瘦
         need = self._pane_width()
         overhead = max(0, self.width() - self._shell.width())
-        if self.width() < PANE_MIN_COLUMN + need + overhead:
-            self.resize(PANE_MIN_COLUMN + need + overhead, self.height())
+        want_w = PANE_MIN_COLUMN + need + overhead
+        if self.width() < want_w:
+            screen = QGuiApplication.screenAt(self.frameGeometry().center())
+            if screen is None:
+                screen = QGuiApplication.primaryScreen()
+            left = screen.availableGeometry().left() if screen is not None else 0
+            grow = want_w - self.width()
+            self.resize(want_w, self.height())
+            # 往左撑：右边缘不动，弹幕那栏在屏幕上就还是原来那个位置，
+            # 画面栏出现在它左边（左边没地方了才往右长，再由下面收进屏幕）
+            self.move(max(left, self.x() - grow), self.y())
+        # 右边要是顶出屏幕，就把整窗往左挪一挪，别让画面栏露在屏幕外
+        self._keep_on_screen()
+        self._sync_pane_shift()
         self.setMinimumWidth(PANE_MIN_COLUMN + PANE_MIN_WIDTH + overhead)
         self._set_player_button(True)
         self._sync_compact_chrome()
         # 布局还没算完，等一拍再按实际栏宽分，否则 QSplitter 会按比例摊
         QTimer.singleShot(0, lambda: self._apply_pane_sizes(need))
+
+    def _restore_player_state(self) -> None:
+        """启动时把画面栏恢复成上次退出时的样子：开着就还开着，位置大小照旧。"""
+        if not self.cfg.get("player_open"):
+            return
+        self._show_player(silent=True)
+        pane = self._player_pane
+        if pane is None or not pane.isVisible():
+            return
+        # 拉开画面栏时窗口会按最小需求重算一次，这里再盖回上次那个大小
+        if self._apply_window_geo(self.cfg.get("window_player")):
+            self._sync_pane_shift()
+            QTimer.singleShot(0, lambda: self._apply_pane_sizes(self._pane_width()))
+
+    def _sync_pane_shift(self) -> None:
+        """记下「为了塞下画面栏，窗口比它本来该在的位置左移了多少」。"""
+        plain = self.cfg.get("window")
+        try:
+            self._pane_shift_x = self.x() - int(plain["x"]) if isinstance(plain, dict) else 0
+        except (KeyError, TypeError, ValueError):
+            self._pane_shift_x = 0
 
     def _apply_pane_sizes(self, need: int) -> None:
         pane = self._player_pane
@@ -2983,16 +3096,21 @@ class FloatingWindow(QWidget):
 
     def _hide_player(self) -> None:
         pane = self._player_pane
-        freed = 0
         if pane is not None:
+            # 收起前先按当前状态记一次，纵向位置/高度这些跟着画面栏没变的东西别丢
+            self._store_geometry()
             # 收起来就把流停掉，别在背后白白占带宽
             pane.disconnect_stream("已收起")
-            freed = pane.width()
             pane.hide()
+        self.cfg["player_open"] = False
         self.setMinimumWidth(PANE_MIN_COLUMN)
-        if freed and self.width() - freed >= PANE_MIN_COLUMN:
-            # 窗口跟着缩回去，别留一条空荡荡的右边
-            self.resize(self.width() - freed, self.height())
+        # 回到拉开画面栏之前那个尺寸和位置（别把分隔条那点宽度越攒越宽）
+        if not self._apply_window_geo(self.cfg.get("window")):
+            # 没记过（第一次用这个功能）：把画面栏和分隔条的宽度减掉就行
+            width = self.width() - (pane.width() if pane else 0) - self._shell.handleWidth()
+            self.resize(max(PANE_MIN_COLUMN, width), self.height())
+        self._pane_shift_x = 0
+        self._save_config_quiet()
         self._set_player_button(False)
         self._sync_compact_chrome()
 
@@ -4045,12 +4163,11 @@ class FloatingWindow(QWidget):
             # 代理线程和播放器一起收掉，别留个后台端口
             self._player_pane.shutdown()
         self.cfg["split"] = self._layout_sizes()
-        self.cfg["window"] = {
-            "x": self.x(),
-            "y": self.y(),
-            "w": self.width(),
-            "h": self.height(),
-        }
+        # 画面栏开着就记「带画面栏」和「不带画面栏」两份，下次启动各归各位
+        self.cfg["player_open"] = bool(
+            self._player_pane is not None and self._player_pane.isVisible()
+        )
+        self._store_geometry()
         try:
             save_gui_config(self.config_path, self.cfg)
         except OSError:
