@@ -368,6 +368,7 @@ QPushButton#ghost:disabled { background: transparent; color: #4f5764; }
 QWidget#playerpane { background: #000000; }
 QWidget#playerbar { background: $panel_bg; }
 QLabel#playerstatus { color: #8b93a1; font-size: 11px; }
+QLabel#playerhint { color: #5d6675; font-size: 12px; background: transparent; }
 QSlider::groove:horizontal { height: 3px; background: rgba(255, 255, 255, 34); border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #5b6472; border-radius: 2px; }
 QSlider::handle:horizontal {
@@ -489,6 +490,7 @@ QPushButton#ghost:disabled { background: transparent; color: #b3bac6; }
 QWidget#playerpane { background: #000000; }
 QWidget#playerbar { background: $panel_bg; }
 QLabel#playerstatus { color: #6b7280; font-size: 11px; }
+QLabel#playerhint { color: #8a94a3; font-size: 12px; background: transparent; }
 QSlider::groove:horizontal { height: 3px; background: #dbe1e9; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #b6c1cf; border-radius: 2px; }
 QSlider::handle:horizontal {
@@ -2906,6 +2908,12 @@ class FloatingWindow(QWidget):
         """画面栏要播哪个房间：优先正在连的，其次房间号输入框。"""
         return int(self.state.real_room or self._parse_room(self.room_input.currentText()) or 0)
 
+    def _danmaku_live(self) -> bool:
+        """弹幕这路连着没有（0 号测试房间不算，它没有直播流）。"""
+        if not self.state.real_room:
+            return False
+        return self.service.running or self._mock_thread is not None
+
     def _ensure_player(self):
         """第一次点才创建画面栏；缺 QtMultimedia 时返回 None 并提示。"""
         if self._player_pane is not None:
@@ -2936,16 +2944,22 @@ class FloatingWindow(QWidget):
 
     def _show_player(self) -> None:
         room = self._player_room()
-        if not room:
-            self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
-            self._set_player_button(False)
-            return
         pane = self._ensure_player()
         if pane is None:
             self._set_player_button(False)
             return
 
-        pane.show_room(room)
+        live = self._danmaku_live()
+        if not room:
+            self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
+        if self._test_mode:
+            reason = "0 号测试房间没有直播画面"
+        elif not room:
+            reason = "先在房间号里填一个房间"
+        else:
+            reason = "等弹幕机连接"
+        # 画面跟着弹幕机的连接走：连着就直接出画面，没连就摆一句提示等它连上
+        pane.show_room(room, live=live, reason=reason)
         pane.show()
         # 画面栏有最小宽度，窗口太窄就先撑开（宽度记在配置里，下次照旧）。
         # 外框（边距 + 边框）不算在分隔条里，得单独补上，否则右边那栏会被压瘦
@@ -3202,6 +3216,9 @@ class FloatingWindow(QWidget):
         self.state.real_room = 0
         self._test_mode = False
         self._refresh_send_state()
+        # 画面跟着一起停，别让断开后还挂着一条流
+        if self._player_pane is not None:
+            self._player_pane.set_live(False, reason="弹幕已断开")
         threading.Thread(target=self._stop_worker, daemon=True).start()
 
     def _stop_worker(self) -> None:
@@ -3462,13 +3479,10 @@ class FloatingWindow(QWidget):
                     # 采集线程把 UP 主昵称一起带回来了，存下来给房间下拉用
                     self._set_room_name(room_no, event.get("uname") or "")
                     self._append_sys(f"已进入 {room_no} · {self.state.title}")
-                    # 画面栏开着就跟着换房间，省得手动再点一次
-                    if (
-                        self._player_pane is not None
-                        and self._player_pane.isVisible()
-                        and self._player_pane.room_id != room_no
-                    ):
-                        self._player_pane.show_room(room_no)
+                    # 画面栏开着就跟着换房间（含断开后重连同一间），省得手动再点。
+                    # force：room 事件意味着弹幕机刚（重）连上，画面也跟着重取一次
+                    if self._player_pane is not None and self._player_pane.isVisible():
+                        self._player_pane.show_room(room_no, live=True, force=True)
                     if self.sender.has_login:
                         who = self.sender.uname or "账号"
                         if self.sender.uname:
@@ -3536,6 +3550,8 @@ class FloatingWindow(QWidget):
             elif kind == "fatal":
                 self._append_sys(f"采集异常：{event.get('error')}")
                 self._set_connected_ui(False)
+                if self._player_pane is not None:
+                    self._player_pane.set_live(False, reason="弹幕已断开")
             elif kind == "ui_stopped":
                 # 断开后必须把房间号清掉，否则发送行会以为还连着，能发到上一个房间
                 self.state.real_room = 0
@@ -3543,6 +3559,8 @@ class FloatingWindow(QWidget):
                 self._set_connected_ui(False)
                 self.dot.setObjectName("dead")
                 self._append_sys("已断开")
+                if self._player_pane is not None:
+                    self._player_pane.set_live(False, reason="弹幕已断开")
 
         if danmaku_rows:
             self.state.messages += len(danmaku_rows)

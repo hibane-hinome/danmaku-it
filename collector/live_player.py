@@ -24,7 +24,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 
-from PySide6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, QUrl, QRunnable, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThreadPool, QTimer, QUrl, QRunnable, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -372,20 +372,12 @@ class _FetchTask(QRunnable):
 # ----- 直播画面栏 -----
 
 
-def _repolish(widget) -> None:
-    """改过 property 之后要让 QSS 重新算一遍，否则样式不跟着变。"""
-    style = widget.style()
-    style.unpolish(widget)
-    style.polish(widget)
-    widget.update()
-
-
 class LivePlayerPane(QWidget):
     """直播画面栏：一块画面 + 一行控制条，嵌在弹幕机左边。
 
-    「连接 / 断开」是同一个按钮的两种状态：连接 = 取流并播放，断开 = 停掉，
-    只停画面，不动弹幕那一路。断流、出错会自己重连几次，次数用完就退回
-    「未连接」，等人再点一次，不会一直空转。
+    这里**没有**自己的连接开关：画面跟着弹幕机那条连接走。弹幕连着、把画面栏
+    拉开就直接出画面；弹幕一断，画面跟着停。中间断流、出错会自己重连几次，
+    主播没开播则慢速轮询，随时按「刷新」都会立刻再取一次流。
 
     单独开窗的版本已经没有了：画面和弹幕放在一个窗口里，看的时候不用来回切。
     """
@@ -410,7 +402,8 @@ class LivePlayerPane(QWidget):
         self._proxy: StreamProxy | None = None
         self._stream: dict | None = None
         self._task: _FetchTask | None = None
-        self._active = False          # 用户想不想看：连接/断开的唯一真值
+        self._active = False          # 该不该有画面：由弹幕机的连接状态决定
+        self._live_room = 0           # 当前这条流属于哪个房间
         self._retries = 0
         self._stalled = 0
         self._full_host: QWidget | None = None
@@ -427,7 +420,7 @@ class LivePlayerPane(QWidget):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._reconnect)
 
-        self._sync_connect()
+        self._sync_controls()
 
     # ----- 界面 -----
 
@@ -440,21 +433,23 @@ class LivePlayerPane(QWidget):
         self.video.setMinimumSize(QSize(200, 120))
         outer.addWidget(self.video, 1)
 
+        # 没有画面时那块黑底上给一句话，否则就是个「坏了？」的黑方块。
+        # 叠在 video 上（不参与布局），出画面时藏起来，反正那时也看不见
+        self.hint = QLabel("等弹幕机连接", self.video)
+        self.hint.setObjectName("playerhint")
+        self.hint.setAlignment(Qt.AlignCenter)
+        self.hint.setWordWrap(True)
+        self.hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.video.installEventFilter(self)
+        self._place_hint()
+
         bar = QWidget(self)
         bar.setObjectName("playerbar")
         row = QHBoxLayout(bar)
         row.setContentsMargins(8, 5, 8, 5)
         row.setSpacing(6)
 
-        # 连接 / 断开：一个按钮两种状态，和主控那排的连接按钮同一套配色
-        self.connect_btn = QPushButton("连接")
-        self.connect_btn.setObjectName("primary")
-        self.connect_btn.setProperty("active", "false")
-        self.connect_btn.setCursor(Qt.PointingHandCursor)
-        self.connect_btn.clicked.connect(self._toggle_connect)
-        row.addWidget(self.connect_btn)
-
-        # 刷新：重新取一次流。卡住、黑屏、刚开播都能按；没连的时候按就当连接
+        # 刷新：重新取一次流。卡住、黑屏、主播刚开播都能按
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setCursor(Qt.PointingHandCursor)
         self.refresh_btn.setToolTip("重新取一次流（卡住、黑屏、主播刚开播都可以按）")
@@ -490,7 +485,7 @@ class LivePlayerPane(QWidget):
         self.qn_box.currentIndexChanged.connect(self._on_quality)
         row.addWidget(self.qn_box)
 
-        self.status = QLabel("未连接 · 点「连接」开始")
+        self.status = QLabel("等弹幕机连接")
         self.status.setObjectName("playerstatus")
         # 状态字只占零头：窄的时候先让位给按钮
         self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -518,6 +513,15 @@ class LivePlayerPane(QWidget):
         state = self.cfg.get("player")
         return state if isinstance(state, dict) else {}
 
+    # 提示字叠在画面区上（不占布局），画面区一改大小就跟着铺满
+    def _place_hint(self) -> None:
+        self.hint.setGeometry(self.video.rect())
+
+    def eventFilter(self, obj, event):  # noqa: N802 - QObject 的接口
+        if obj is self.video and event.type() in (QEvent.Resize, QEvent.Show):
+            self._place_hint()
+        return super().eventFilter(obj, event)
+
     def _remember(self) -> None:
         """清晰度、音量落盘（嵌进主窗口后不再记窗口位置）。"""
         state = dict(self._saved())
@@ -526,16 +530,21 @@ class LivePlayerPane(QWidget):
         if self._save_config:
             self._save_config()
 
-    # ----- 连接 / 断开 -----
+    # ----- 跟随弹幕机的连接状态 -----
 
-    def _toggle_connect(self) -> None:
-        if self._active:
-            self.disconnect_stream()
+    def set_live(self, on: bool, room_id: int = 0, reason: str = "") -> None:
+        """弹幕机连上/断开了：画面跟着走，这里没有自己的开关。
+
+        ``on=True`` 时如果已经在这个房间播着，什么都不做——窗口挪一下、
+        重画一次都不该重新取流。
+        """
+        if on:
+            self.connect_stream(room_id or None)
         else:
-            self.connect_stream()
+            self.disconnect_stream(reason or "弹幕未连接")
 
-    def connect_stream(self, room_id: int | None = None) -> None:
-        """连上（或者重连）这个房间的画面。"""
+    def connect_stream(self, room_id: int | None = None, force: bool = False) -> None:
+        """取这个房间的流并播放。``force`` 表示弹幕机刚连上，无条件重取一次。"""
         room = int(room_id or self.room_id or 0)
         if not room and self._room_provider is not None:
             try:
@@ -545,33 +554,35 @@ class LivePlayerPane(QWidget):
         if not room:
             self._set_status("没有房间号")
             return
+        if not force and self._active and room == self._live_room:
+            return  # 已经在播这个房间了
         self.room_id = room
+        self._live_room = room
         self._active = True
         self._retries = 0
         self._stalled = 0
-        self._sync_connect()
+        self._sync_controls()
+        self.player.stop()  # 换房间时先停旧的，别让两路流打架
         self._fetch()
 
     def disconnect_stream(self, reason: str = "已断开") -> None:
-        """停掉画面。弹幕那一路完全不受影响。"""
+        """停掉画面。"""
         self._active = False
+        self._live_room = 0
         self._retry_timer.stop()
         self.player.stop()
         self.player.setSource(QUrl())
         self._stream = None
-        self._set_status(reason)
-        self._sync_connect()
+        self._set_status(reason or "弹幕未连接")
+        self._sync_controls()
 
     def is_streaming(self) -> bool:
         return self._active
 
     def refresh(self) -> None:
-        """重新取一次流：卡住、黑屏、主播刚开播都按这个。
-
-        没连的时候按等于「连接」——反正下一步都是取流，不如省一次点击。
-        """
+        """重新取一次流：卡住、黑屏、主播刚开播都按这个。"""
         if not self._active:
-            self.connect_stream()
+            self._set_status("等弹幕机连接")
             return
         self._retries = 0
         self._stalled = 0
@@ -579,23 +590,19 @@ class LivePlayerPane(QWidget):
         self.player.stop()
         self._fetch()
 
-    def show_room(self, room_id: int, autoplay: bool = False) -> None:
+    def show_room(self, room_id: int, live: bool = True, reason: str = "", force: bool = False) -> None:
         """画面栏被拉开 / 换了房间时叫一次。
 
-        默认**不自动连**：拉开画面栏只准备地址，连不连由「连接」按钮说话。
-        正在播的时候换房间则直接换流，不算额外的自动播放。
+        ``live`` 是弹幕机此刻的状态：连着就立刻出画面，没连就先摆一句提示，
+        等它连上（主窗口会在 room 事件里再叫一次）。
         """
         room = int(room_id or 0)
-        if room and room != self.room_id:
-            self.room_id = room
-            if self._active:
-                self.player.stop()
-                self._fetch()
-                return
-        if autoplay and not self._active:
-            self.connect_stream(room)
-        elif not self._active:
-            self._set_status("未连接" if not self.room_id else f"未连接 · {self.room_id}")
+        if not live:
+            self.disconnect_stream(reason or "等弹幕机连接")
+            if room:
+                self.room_id = room
+            return
+        self.connect_stream(room or self.room_id, force=force)
 
     def set_sender(self, sender) -> None:
         """换账号：代理里存着 cookie，请求头得跟着换，所以代理整个重建。"""
@@ -608,19 +615,13 @@ class LivePlayerPane(QWidget):
         if self._active:
             self.player.stop()
             self._fetch()
-        else:
-            self._set_status("未连接")
 
-    def _sync_connect(self) -> None:
+    def _sync_controls(self) -> None:
+        """有流才让动清晰度/暂停/刷新，没流的时候按了也没意义。"""
         on = self._active
-        self.connect_btn.setText("断开" if on else "连接")
-        self.connect_btn.setProperty("active", "true" if on else "false")
-        _repolish(self.connect_btn)
-        self.connect_btn.setToolTip(
-            "停掉画面（弹幕照常收）" if on else "取这个房间的直播流并播放，不打开直播间网页"
-        )
-        self.play_btn.setEnabled(on)
-        self.qn_box.setEnabled(on)
+        for widget in (self.refresh_btn, self.play_btn, self.qn_box):
+            widget.setEnabled(on)
+        self.hint.setVisible(not on)
         self.state_changed.emit(on)
 
     # ----- 取流 / 播放 -----
@@ -653,11 +654,14 @@ class LivePlayerPane(QWidget):
     def _on_fetch_failed(self, message: str) -> None:
         if not self._active:
             return
-        self._set_status(message)
-        # 没开播、没有可用流这类问题重试也没用，直接退回「未连接」
+        # 没开播、没有可用流：重试几次也不会变，但主播可能过会儿就开播了。
+        # 这里不算失败次数，改成 30 秒慢慢问一次，按「刷新」则立刻再取。
         if "没在播" in message or "没有可用" in message:
-            self.disconnect_stream(message)
+            self._set_status(f"{message} · 30 秒后再试")
+            self._retry_timer.stop()
+            self._retry_timer.start(30_000)
             return
+        self._set_status(message)
         self._schedule_retry()
 
     def _on_status(self, status) -> None:
@@ -691,7 +695,8 @@ class LivePlayerPane(QWidget):
         if not self._active or self._retry_timer.isActive():
             return
         if self._retries >= MAX_RETRIES:
-            self.disconnect_stream("连接失败，点「连接」再试")
+            # 别自己把状态打回「没连」，用户还能按刷新再来一次
+            self._set_status("画面连不上 · 点「刷新」再试")
             return
         self._retries += 1
         delay = min(2 + self._retries * 2, 10)
@@ -730,6 +735,9 @@ class LivePlayerPane(QWidget):
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
         self.status.setToolTip(text)
+        if not self._active:
+            # 没画面的时候，黑底上那句提示就是状态栏这句
+            self.hint.setText(text)
 
     # ----- 全屏：把整条画面栏临时搬到一个全屏窗口里 -----
 
