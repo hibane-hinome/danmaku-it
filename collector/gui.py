@@ -18,7 +18,7 @@ from string import Template
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QDesktopServices, QGuiApplication, QIcon,
-    QImage, QPainter, QPixmap,
+    QImage, QKeySequence, QPainter, QPixmap, QShortcut,
     QTextBlockUserData, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -1005,7 +1005,7 @@ class FloatingWindow(QWidget):
         # 左侧的直播画面栏，第一次点「看直播」才创建
         self._player_pane = None
         # 为塞下画面栏把窗口整体往左挪了多少，记窗口几何时要扣掉
-        self._pane_shift_x = 0
+        self._column_keep = 0
         self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
@@ -2834,9 +2834,8 @@ class FloatingWindow(QWidget):
         """记窗口几何。
 
         画面栏开着的时候记两份：``window_player`` 是当前这个（含画面栏的）大小，
-        ``window`` 是「还没拉画面栏时」那一份——宽度保持拉开之前那个值（拉开时
-        窗口要么被撑宽、要么整体左移，照当前值记就把弹幕机本来的宽度弄丢了），
-        横向位置扣掉为自己撑开而挪的那一段，用户真挪了窗口也还算数。
+        ``window`` 是「还没拉画面栏时」那一份——宽度就是弹幕栏自己那一条，
+        横向位置按「窗口右边减去这条宽度」算，收起时弹幕栏还在原地。
         """
         if self._maximized or self._in_player_full:
             # 最大化/画面栏全屏期间的几何是临时的，别把正常时候的记录冲掉
@@ -2845,24 +2844,15 @@ class FloatingWindow(QWidget):
         pane = self._player_pane
         if pane is not None and pane.isVisible() and pane.width() > 0:
             self.cfg["window_player"] = dict(geo)
-            plain = self.cfg.get("window")
-            if isinstance(plain, dict) and plain.get("w"):
-                # 高度和上下位置画面栏不影响，跟着走；横向要扣掉「为塞下画面栏
-                # 而自己挪的那一段」，剩下的才是用户真的挪了多远；宽度保持原样
-                self.cfg["window"] = {
-                    "x": geo["x"] - self._pane_shift_x,
-                    "y": geo["y"],
-                    "w": plain["w"],
-                    "h": geo["h"],
-                }
-            else:
-                # 老配置没有这一份：只好按减法估一个
-                self.cfg["window"] = {
-                    "x": geo["x"],
-                    "y": geo["y"],
-                    "w": max(PANE_MIN_COLUMN, geo["w"] - pane.width() - self._shell.handleWidth()),
-                    "h": geo["h"],
-                }
+            column = self._column_width_of()
+            self._column_keep = column
+            # 弹幕栏永远贴在窗口右边，所以「没有画面栏时」的窗口就是右边这一条
+            self.cfg["window"] = {
+                "x": geo["x"] + geo["w"] - column,
+                "y": geo["y"],
+                "w": column,
+                "h": geo["h"],
+            }
         else:
             self.cfg["window"] = geo
         self._save_config_quiet()
@@ -2876,6 +2866,8 @@ class FloatingWindow(QWidget):
         super().resizeEvent(event)
         # 拖窄时标题/状态字先让位，别让它们撑着整行
         self._sync_compact_chrome()
+        # 画面栏开着时，窗口怎么变都由画面栏吸收，弹幕栏宽度保持不变
+        self._apply_column_width()
         self._queue_geometry_save()
 
     def _column_width(self) -> int:
@@ -2899,7 +2891,11 @@ class FloatingWindow(QWidget):
         self._place_identity_spacer(width >= IDENTITY_SPACER_WIDTH)
 
     def _on_shell_moved(self, _pos: int, _index: int) -> None:
-        """拖分隔条：重算窄模式，顺手记住画面栏宽度。"""
+        """拖分隔条：重算窄模式，记住弹幕栏和画面栏各自的宽度。"""
+        sizes = self._shell.sizes()
+        if len(sizes) == 2 and sizes[1] > 0:
+            # 用户亲手挪过，弹幕栏的新宽度就是之后窗口缩放要守住的宽度
+            self._column_keep = sizes[1]
         self._sync_compact_chrome()
         self._on_player_pane_resized()
 
@@ -2974,9 +2970,9 @@ class FloatingWindow(QWidget):
             self._drag_origin = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseDoubleClickEvent(self, event) -> None:
-        # 双击标题区：最大化 / 还原。按钮和输入框自己会吃掉双击，落不到这里
+        # 双击不再最大化（改成画面栏上的「最大/还原」按钮），这里只保证
+        # 标题区的双击不会被当成两次拖拽的开头
         if event.button() == Qt.LeftButton and event.position().y() < TITLE_DRAG_HEIGHT:
-            self._toggle_maximize()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -2997,6 +2993,8 @@ class FloatingWindow(QWidget):
         }
         self._maximized = True
         self.setGeometry(self._screen_area())
+        self._sync_max_button()
+        self._apply_column_width()
 
     def _unmaximize(self, follow_cursor: QPoint | None = None) -> None:
         if not self._maximized:
@@ -3012,9 +3010,13 @@ class FloatingWindow(QWidget):
         self._normal_geo = None
         if follow_cursor is not None and geo.get("w"):
             self.move(int(follow_cursor.x() - geo["w"] * ratio), follow_cursor.y())
-        if self._player_pane is not None and self._player_pane.isVisible():
-            self._sync_pane_shift()
-            QTimer.singleShot(0, lambda: self._apply_pane_sizes(self._pane_width()))
+        self._sync_max_button()
+        self._apply_column_width()
+
+    def _sync_max_button(self) -> None:
+        pane = self._player_pane
+        if pane is not None:
+            pane.set_maximized(self._maximized)
 
     def _screen_area(self):
         """窗口现在所在的屏幕（多显示器时最大化到原地，不跨屏乱跳）。"""
@@ -3077,10 +3079,12 @@ class FloatingWindow(QWidget):
             parent=self._shell,
         )
         self._shell.insertWidget(0, pane)
-        # 窗口变宽变窄都由右边的弹幕栏吸收，画面栏宽度靠拖分隔条自己定
-        self._shell.setStretchFactor(0, 0)
-        self._shell.setStretchFactor(1, 1)
+        # 多出来的宽度归画面栏，弹幕栏守住自己那条宽度（见 _apply_column_width）
+        self._shell.setStretchFactor(0, 1)
+        self._shell.setStretchFactor(1, 0)
         pane.fullscreen_changed.connect(self._on_player_fullscreen)
+        pane.maximize_requested.connect(self._toggle_maximize)
+        pane.set_maximized(self._maximized)
         pane.hide()
         self._player_pane = pane
         return pane
@@ -3094,6 +3098,11 @@ class FloatingWindow(QWidget):
 
         # 先把「还没拉开画面栏」时的窗口几何记下来，收起时照着它回去
         self._store_geometry()
+        # 弹幕栏的宽度就按「没画面栏时窗口多宽」来，之后窗口怎么变它都不动
+        try:
+            self._column_keep = int((self.cfg.get("window") or {})["w"])
+        except (KeyError, TypeError, ValueError):
+            self._column_keep = self.width()
         self.cfg["player_open"] = True
         self._save_config_quiet()
 
@@ -3113,7 +3122,7 @@ class FloatingWindow(QWidget):
         # 外框（边距 + 边框）不算在分隔条里，得单独补上，否则右边那栏会被压瘦
         need = self._pane_width()
         overhead = max(0, self.width() - self._shell.width())
-        want_w = PANE_MIN_COLUMN + need + overhead
+        want_w = max(PANE_MIN_COLUMN, self._column_keep) + need + overhead + self._shell.handleWidth()
         if self.width() < want_w and not self._maximized:
             screen = QGuiApplication.screenAt(self.frameGeometry().center())
             if screen is None:
@@ -3126,12 +3135,11 @@ class FloatingWindow(QWidget):
             self.move(max(left, self.x() - grow), self.y())
         # 右边要是顶出屏幕，就把整窗往左挪一挪，别让画面栏露在屏幕外
         self._keep_on_screen()
-        self._sync_pane_shift()
         self.setMinimumWidth(PANE_MIN_COLUMN + PANE_MIN_WIDTH + overhead)
         self._set_player_button(True)
         self._sync_compact_chrome()
         # 布局还没算完，等一拍再按实际栏宽分，否则 QSplitter 会按比例摊
-        QTimer.singleShot(0, lambda: self._apply_pane_sizes(need))
+        QTimer.singleShot(0, self._apply_column_width)
 
     def _restore_player_state(self) -> None:
         """启动时把画面栏恢复成上次退出时的样子：开着就还开着，位置大小照旧。"""
@@ -3143,15 +3151,14 @@ class FloatingWindow(QWidget):
             return
         # 拉开画面栏时窗口会按最小需求重算一次，这里再盖回上次那个大小
         if self._apply_window_geo(self.cfg.get("window_player")):
-            self._sync_pane_shift()
-            QTimer.singleShot(0, lambda: self._apply_pane_sizes(self._pane_width()))
+            QTimer.singleShot(0, self._apply_column_width)
 
     def _on_player_fullscreen(self, on: bool) -> None:
-        """画面栏全屏时主窗口让位。
+        """画面栏全屏时，弹幕机缩成一条弹幕栏贴在旁边。
 
-        主窗口是常驻置顶的，会一直压在全屏画面上面；而且画面栏从分隔条里
-        被摘出去以后，弹幕栏会撑满整窗，看起来就像窗口「变回拉画面栏时
-        那么大」。所以进全屏先把自己藏起来，退出再原样回来。
+        全屏宿主是另一个顶层窗口，画面栏离开分隔条后弹幕栏会撑满整窗；
+        而且主窗口常驻置顶，整窗宽度会压掉大半个画面。所以全屏期间只留
+        弹幕栏那一条（跟「收起画面栏」时一样宽），退出再原样回来。
         """
         if on:
             self._in_player_full = True
@@ -3161,10 +3168,22 @@ class FloatingWindow(QWidget):
             self._full_split = list(self._shell.sizes())
             if self._geo_timer is not None:
                 self._geo_timer.stop()
-            self.hide()
+            self._install_full_shortcuts(True)
+            column = self._column_keep or PANE_MIN_COLUMN
+            # 只剩弹幕栏了，最小宽度也得放开，否则缩不回去
+            self.setMinimumWidth(PANE_MIN_COLUMN)
+            if not self._maximized:
+                right = self.x() + self.width()
+                self.setGeometry(right - column, self.y(), column, self.height())
+            self._sync_compact_chrome()
             return
         self._in_player_full = False
-        self.show()
+        self._install_full_shortcuts(False)
+        self.setMinimumWidth(
+            PANE_MIN_COLUMN + PANE_MIN_WIDTH + max(0, self.width() - self._shell.width())
+            if self._player_pane is not None and self._player_pane.isVisible()
+            else PANE_MIN_COLUMN
+        )
         geo = self._full_geo
         if geo:
             try:
@@ -3172,27 +3191,54 @@ class FloatingWindow(QWidget):
             except (KeyError, TypeError, ValueError):
                 pass
         self._full_geo = None
-        split = self._full_split
         self._full_split = None
-        pane = self._player_pane
-        if split and pane is not None and pane.isVisible():
-            self._shell.setSizes(split)
-            self._sync_compact_chrome()
+        self._apply_column_width()
+        self._sync_compact_chrome()
 
-    def _sync_pane_shift(self) -> None:
-        """记下「为了塞下画面栏，窗口比它本来该在的位置左移了多少」。"""
-        plain = self.cfg.get("window")
-        try:
-            self._pane_shift_x = self.x() - int(plain["x"]) if isinstance(plain, dict) else 0
-        except (KeyError, TypeError, ValueError):
-            self._pane_shift_x = 0
-
-    def _apply_pane_sizes(self, need: int) -> None:
-        pane = self._player_pane
-        if pane is None or not pane.isVisible():
+    def _install_full_shortcuts(self, on: bool) -> None:
+        """全屏时焦点可能落在弹幕机上，那边也得能按 Esc / F 退出来。"""
+        for shortcut in getattr(self, "_full_shortcuts", []):
+            shortcut.setEnabled(on)
+        if not on:
             return
-        rest = max(PANE_MIN_COLUMN, self._shell.width() - need)
-        self._shell.setSizes([need, rest])
+        if getattr(self, "_full_shortcuts", None):
+            return
+        self._full_shortcuts = []
+        for key in (QKeySequence(Qt.Key_Escape), QKeySequence("F")):
+            shortcut = QShortcut(key, self)
+            shortcut.activated.connect(self._exit_player_full)
+            self._full_shortcuts.append(shortcut)
+
+    def _exit_player_full(self) -> None:
+        pane = self._player_pane
+        if pane is not None and pane.in_fullscreen():
+            pane._leave_full()
+
+    def _column_width_of(self) -> int:
+        """弹幕栏现在实际有多宽（分隔条两段里的后一段）。"""
+        sizes = self._shell.sizes()
+        if len(sizes) == 2 and sizes[1] > 0:
+            return sizes[1]
+        return self.width()
+
+    def _apply_column_width(self) -> None:
+        """窗口变宽变窄时，弹幕栏保持自己的宽度，多出来的都归画面栏。
+
+        最大化、拖窗口边、改分辨率都走这里：弹幕栏一宽，几行文字就散开了，
+        而画面栏宽一点正好。真放不下时先压画面栏，压到它的下限再动弹幕栏。
+        """
+        pane = self._player_pane
+        if pane is None or not pane.isVisible() or self._in_player_full:
+            return
+        total = self._shell.width()
+        if total <= 0:
+            return
+        keep = self._column_keep or PANE_MIN_COLUMN
+        column = min(max(keep, PANE_MIN_COLUMN), max(PANE_MIN_COLUMN, total - PANE_MIN_WIDTH))
+        sizes = self._shell.sizes()
+        if len(sizes) == 2 and abs(sizes[1] - column) <= 1:
+            return
+        self._shell.setSizes([max(0, total - column), column])
         self._sync_compact_chrome()
 
     def _hide_player(self) -> None:
@@ -3211,7 +3257,6 @@ class FloatingWindow(QWidget):
             # 没记过（第一次用这个功能）：把画面栏和分隔条的宽度减掉就行
             width = self.width() - (pane.width() if pane else 0) - self._shell.handleWidth()
             self.resize(max(PANE_MIN_COLUMN, width), self.height())
-        self._pane_shift_x = 0
         self._save_config_quiet()
         self._set_player_button(False)
         self._sync_compact_chrome()

@@ -425,6 +425,7 @@ class LivePlayerPane(QWidget):
 
     state_changed = Signal(bool)  # True=正在播（含连接中），False=已断开
     fullscreen_changed = Signal(bool)  # True=进了画面全屏，False=退出来了
+    maximize_requested = Signal()  # 控制条上的「最大/还原」，窗口本身归主窗口管
 
     def __init__(
         self,
@@ -535,6 +536,12 @@ class LivePlayerPane(QWidget):
         self.status.setMinimumWidth(0)
         row.addWidget(self.status, 1)
 
+        self.max_btn = QPushButton("最大")
+        self.max_btn.setCursor(Qt.PointingHandCursor)
+        self.max_btn.setToolTip("把整个窗口最大化 / 还原（画面栏会吸掉多出来的宽度）")
+        self.max_btn.clicked.connect(self.maximize_requested.emit)
+        row.addWidget(self.max_btn)
+
         self.full_btn = QPushButton("全屏")
         self.full_btn.setCursor(Qt.PointingHandCursor)
         self.full_btn.setToolTip("全屏看画面（Esc / F 退出）")
@@ -624,6 +631,9 @@ class LivePlayerPane(QWidget):
 
     def is_streaming(self) -> bool:
         return self._active
+
+    def in_fullscreen(self) -> bool:
+        return self._full_host is not None
 
     def refresh(self) -> None:
         """重新取一次流：卡住、黑屏、主播刚开播都按这个。"""
@@ -804,6 +814,14 @@ class LivePlayerPane(QWidget):
             self._leave_full()
         else:
             self._enter_full()
+
+    def set_maximized(self, on: bool) -> None:
+        """窗口最大化状态由主窗口说了算，这里只跟着改按钮文案。"""
+        self.max_btn.setText("还原" if on else "最大")
+        self.max_btn.setToolTip(
+            "把整个窗口还原成原来的大小" if on
+            else "把整个窗口最大化（画面栏吸掉多出来的宽度）"
+        )
 
     def _enter_full(self) -> None:
         parent = self.parentWidget()
