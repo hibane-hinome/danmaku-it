@@ -91,6 +91,11 @@ IDENTITY_SPACER_WIDTH = 420
 # 窗口窄于这个宽度时，房间号那一行的右侧已经装不下「在线 12.3万 · 舰长 2721」
 # （实测要 198px，510 左右才够，留点余量），把状态字挪到账号下面一行并靠右
 STAT_INLINE_WIDTH = 520
+# 弹幕栏自己的最小宽度：画面栏拉出来以后，右侧这一栏至少留这么宽，
+# 再窄账号行、发送区就挤成一团了（和窗口最小宽度 320 是同一个数）
+PANE_MIN_COLUMN = 320
+# 画面栏最小宽度：控制条上有连接/暂停/音量/清晰度/全屏，再窄按钮会互相压
+PANE_MIN_WIDTH = 300
 
 
 # ---------------- config helpers ----------------
@@ -358,6 +363,17 @@ QPushButton:disabled {
 }
 QPushButton#primary:disabled { background: #2b3240; color: #7d8797; }
 QPushButton#ghost:disabled { background: transparent; color: #4f5764; }
+
+/* 直播画面栏：整块铺黑，控制条贴着底板色，和主界面一套按钮 */
+QWidget#playerpane { background: #000000; }
+QWidget#playerbar { background: $panel_bg; }
+QLabel#playerstatus { color: #8b93a1; font-size: 11px; }
+QSlider::groove:horizontal { height: 3px; background: rgba(255, 255, 255, 34); border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #5b6472; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 10px; height: 10px; margin: -4px 0; border-radius: 5px; background: #9aa3b2;
+}
+QSlider::handle:horizontal:hover { background: #c8cedb; }
 QLineEdit:disabled, QComboBox:disabled {
     color: #5d6878;
     background: rgba(255, 255, 255, 8);
@@ -469,6 +485,16 @@ QPushButton:disabled {
 }
 QPushButton#primary:disabled { background: #b9cdf3; color: #ffffff; }
 QPushButton#ghost:disabled { background: transparent; color: #b3bac6; }
+
+QWidget#playerpane { background: #000000; }
+QWidget#playerbar { background: $panel_bg; }
+QLabel#playerstatus { color: #6b7280; font-size: 11px; }
+QSlider::groove:horizontal { height: 3px; background: #dbe1e9; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #b6c1cf; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 10px; height: 10px; margin: -4px 0; border-radius: 5px; background: #8f9aa9;
+}
+QSlider::handle:horizontal:hover { background: #6b7686; }
 QLineEdit:disabled, QComboBox:disabled {
     color: #a8b0bd;
     background: #f7f9fb;
@@ -972,8 +998,8 @@ class FloatingWindow(QWidget):
         self._emote_message = ""
         self._send_options: dict | None = None
         self._emoticon_panel: EmoticonPanel | None = None
-        # 看直播的播放窗口，第一次点按钮才创建
-        self._player = None
+        # 左侧的直播画面栏，第一次点「看直播」才创建
+        self._player_pane = None
         self._settings: SettingsPopup | None = None
         self._danmaku_pending: list[dict] = []
         self._pending_images = 0
@@ -1055,11 +1081,11 @@ class FloatingWindow(QWidget):
         colors = self._c
 
         self.setStyleSheet(self._stylesheet())
-        player = getattr(self, "_player", None)
-        if player is not None:
-            player.theme = self.theme
-            player._apply_theme()
+        # 画面栏在主窗口里，样式跟着主 QSS 走，这里不用再单独刷一遍
         self.splitter.setStyleSheet(
+            f"QSplitter::handle {{ background: {colors['split']}; }}"
+        )
+        self._shell.setStyleSheet(
             f"QSplitter::handle {{ background: {colors['split']}; }}"
         )
         self._shadow.setColor(QColor(*colors["shadow"]))
@@ -1160,9 +1186,24 @@ class FloatingWindow(QWidget):
         panel.setGraphicsEffect(shadow)
         self._shadow = shadow
 
-        root = QVBoxLayout(panel)
-        root.setContentsMargins(12, 10, 12, 10)
+        # 外壳：左边可以长出一条「直播画面栏」，右边永远是弹幕机本体。
+        # 画面栏是懒创建的，没点「看直播」之前这里只有右边一栏。
+        shell = QSplitter(Qt.Horizontal, panel)
+        shell.setChildrenCollapsible(False)
+        shell.setHandleWidth(6)
+        self._shell = shell
+        panel_box = QVBoxLayout(panel)
+        panel_box.setContentsMargins(12, 10, 12, 10)
+        panel_box.setSpacing(0)
+        panel_box.addWidget(shell)
+
+        content = QWidget(panel)
+        self._content = content
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
+        shell.addWidget(content)
+        shell.splitterMoved.connect(self._on_shell_moved)
 
         root.addLayout(self._build_header())
         root.addLayout(self._build_control_row())
@@ -1440,6 +1481,9 @@ class FloatingWindow(QWidget):
         was_connected = self._room_ready()
         self.sender = DanmakuSender(self.cfg, account)
         self._sender_path = account.path if account is not None else ""
+        # 画面栏的代理里存着上一个账号的 cookie，跟着换掉
+        if self._player_pane is not None:
+            self._player_pane.set_sender(self.sender)
         self._emote_room = 0
         self._emote_packages = []
         self._emote_message = ""
@@ -2454,15 +2498,17 @@ class FloatingWindow(QWidget):
         self.connect_btn.clicked.connect(self._toggle_connect)
         footer.addWidget(self.connect_btn)
 
-        # 看直播：直接在应用里出画面，不开直播间网页（页面会被别人的爬虫记到）
+        # 看直播：在窗口左边拉出一条画面栏，不开直播间网页（页面会被别人的爬虫记到）。
+        # 按下态就是「画面栏开着」，文案跟着变，宽度和原来一样是三个字
         self.player_btn = QPushButton("看直播")
         self.player_btn.setObjectName("ghost")
+        self.player_btn.setCheckable(True)
         self.player_btn.setCursor(Qt.PointingHandCursor)
         self.player_btn.setToolTip(
-            "在单独的窗口里直接播这个房间的画面，不打开直播间网页——"
-            "网页会被各种第三方观众统计/盯播脚本抓到"
+            "在左边拉出一条直播画面栏，不打开直播间网页——"
+            "网页会被各种第三方观众统计/盯播脚本抓到。再点一次收起"
         )
-        self.player_btn.clicked.connect(self._open_player)
+        self.player_btn.clicked.connect(self._toggle_player)
         footer.addWidget(self.player_btn)
 
         self.pane_btn = QPushButton("栏目")
@@ -2740,14 +2786,31 @@ class FloatingWindow(QWidget):
         self._sync_compact_chrome()
         self._queue_geometry_save()
 
+    def _column_width(self) -> int:
+        """右侧弹幕栏实际有多宽。
+
+        画面栏拉出来以后窗口会变宽，但窄模式该看的是「弹幕那栏还剩多少」，
+        所以要把左边那截扣掉，阈值（420 / 520）才还是原来那套。
+        """
+        pane = self._player_pane
+        if pane is not None and pane.isVisible():
+            return max(0, self.width() - pane.width() - self._shell.handleWidth())
+        return self.width()
+
     def _sync_compact_chrome(self) -> None:
         """窄模式：状态字挪到账号下面一行、账号行右边不再留白。
 
         标题不按宽度藏：装不下会自己滚（见 MarqueeLabel）。
         """
-        width = self.width()
+        width = self._column_width()
         self._place_stat_label(width < STAT_INLINE_WIDTH)
         self._place_identity_spacer(width >= IDENTITY_SPACER_WIDTH)
+
+    def _on_shell_moved(self, _pos: int, _index: int) -> None:
+        """拖分隔条：重算窄模式，顺手记住画面栏宽度。"""
+        self._sync_compact_chrome()
+        self._on_player_pane_resized()
+
 
     def _place_identity_spacer(self, present: bool) -> None:
         """窄的时候把账号行末尾的留白摘掉，让两个下拉铺满整行。"""
@@ -2828,41 +2891,115 @@ class FloatingWindow(QWidget):
         else:
             self._connect()
 
-    # ----- 看直播 -----
+    # ----- 看直播（画面栏嵌在左边，弹幕在右边） -----
 
-    def _open_player(self) -> None:
-        """开一个独立的播放窗口，直接播直播间画面。
+    def _toggle_player(self) -> None:
+        if self.player_btn.isChecked():
+            self._show_player()
+        else:
+            self._hide_player()
 
-        不跳浏览器是有原因的：直播间页面会被第三方观众统计、盯播脚本抓走，
-        等于对外宣布「这个人在看谁」。这里走官方取流接口自己解，不产生页面访问。
-        """
-        room = self.state.real_room or self._parse_room(self.room_input.currentText())
-        if not room:
-            self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
-            return
+    def _player_room(self) -> int:
+        """画面栏要播哪个房间：优先正在连的，其次房间号输入框。"""
+        return int(self.state.real_room or self._parse_room(self.room_input.currentText()) or 0)
+
+    def _ensure_player(self):
+        """第一次点才创建画面栏；缺 QtMultimedia 时返回 None 并提示。"""
+        if self._player_pane is not None:
+            return self._player_pane
         try:
-            from .live_player import LivePlayerWindow
+            from .live_player import LivePlayerPane
         except ImportError:
             self._append_sys(
                 '看直播需要 PySide6-Addons（缺 QtMultimedia）：'
                 '在项目目录跑 pip install "PySide6-Addons>=6.6"'
             )
+            return None
+
+        pane = LivePlayerPane(
+            self.sender,
+            self.cfg,
+            room_provider=self._player_room,
+            save_config=self._save_config_quiet,
+            parent=self._shell,
+        )
+        self._shell.insertWidget(0, pane)
+        # 窗口变宽变窄都由右边的弹幕栏吸收，画面栏宽度靠拖分隔条自己定
+        self._shell.setStretchFactor(0, 0)
+        self._shell.setStretchFactor(1, 1)
+        pane.hide()
+        self._player_pane = pane
+        return pane
+
+    def _show_player(self) -> None:
+        room = self._player_room()
+        if not room:
+            self._append_sys("看直播：先连上一个房间，或者在房间号里填一个")
+            self._set_player_button(False)
+            return
+        pane = self._ensure_player()
+        if pane is None:
+            self._set_player_button(False)
             return
 
-        win = getattr(self, "_player", None)
-        if win is None:
-            win = LivePlayerWindow(
-                self.sender, room, self.cfg, self.theme, self._save_config_quiet
-            )
-            self._player = win
-        else:
-            # 账号换了 cookie 就要换，房间换了要重新取流
-            win.set_sender(self.sender)
-            if win.room_id != room:
-                win.open_room(room)
-        win.show()
-        win.raise_()
-        win.activateWindow()
+        pane.show_room(room)
+        pane.show()
+        # 画面栏有最小宽度，窗口太窄就先撑开（宽度记在配置里，下次照旧）。
+        # 外框（边距 + 边框）不算在分隔条里，得单独补上，否则右边那栏会被压瘦
+        need = self._pane_width()
+        overhead = max(0, self.width() - self._shell.width())
+        if self.width() < PANE_MIN_COLUMN + need + overhead:
+            self.resize(PANE_MIN_COLUMN + need + overhead, self.height())
+        self.setMinimumWidth(PANE_MIN_COLUMN + PANE_MIN_WIDTH + overhead)
+        self._set_player_button(True)
+        self._sync_compact_chrome()
+        # 布局还没算完，等一拍再按实际栏宽分，否则 QSplitter 会按比例摊
+        QTimer.singleShot(0, lambda: self._apply_pane_sizes(need))
+
+    def _apply_pane_sizes(self, need: int) -> None:
+        pane = self._player_pane
+        if pane is None or not pane.isVisible():
+            return
+        rest = max(PANE_MIN_COLUMN, self._shell.width() - need)
+        self._shell.setSizes([need, rest])
+        self._sync_compact_chrome()
+
+    def _hide_player(self) -> None:
+        pane = self._player_pane
+        freed = 0
+        if pane is not None:
+            # 收起来就把流停掉，别在背后白白占带宽
+            pane.disconnect_stream("已收起")
+            freed = pane.width()
+            pane.hide()
+        self.setMinimumWidth(PANE_MIN_COLUMN)
+        if freed and self.width() - freed >= PANE_MIN_COLUMN:
+            # 窗口跟着缩回去，别留一条空荡荡的右边
+            self.resize(self.width() - freed, self.height())
+        self._set_player_button(False)
+        self._sync_compact_chrome()
+
+    def _pane_width(self) -> int:
+        """画面栏宽度：上次拖好的宽度，第一次给个 420。"""
+        try:
+            width = int(self.cfg.get("player_pane_w") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        return max(PANE_MIN_WIDTH, min(960, width or 420))
+
+    def _on_player_pane_resized(self) -> None:
+        """拖分隔条只在用户动手时记，别在打开/收起时把默认值写坏。"""
+        pane = self._player_pane
+        if pane is None or not pane.isVisible():
+            return
+        self.cfg["player_pane_w"] = pane.width()
+        self._save_config_quiet()
+
+    def _set_player_button(self, on: bool) -> None:
+        self.player_btn.blockSignals(True)
+        self.player_btn.setChecked(on)
+        self.player_btn.blockSignals(False)
+        self.player_btn.setText("关画面" if on else "看直播")
 
     def _fill_room_history(self, keep_text: str = "") -> None:
         history = [int(room) for room in (self.cfg.get("room_history") or [])]
@@ -3322,6 +3459,13 @@ class FloatingWindow(QWidget):
                     # 采集线程把 UP 主昵称一起带回来了，存下来给房间下拉用
                     self._set_room_name(room_no, event.get("uname") or "")
                     self._append_sys(f"已进入 {room_no} · {self.state.title}")
+                    # 画面栏开着就跟着换房间，省得手动再点一次
+                    if (
+                        self._player_pane is not None
+                        and self._player_pane.isVisible()
+                        and self._player_pane.room_id != room_no
+                    ):
+                        self._player_pane.show_room(room_no)
                     if self.sender.has_login:
                         who = self.sender.uname or "账号"
                         if self.sender.uname:
@@ -3876,6 +4020,9 @@ class FloatingWindow(QWidget):
         self._avatar_images.stop()
         if self._emoticon_panel is not None:
             self._emoticon_panel.close()
+        if self._player_pane is not None:
+            # 代理线程和播放器一起收掉，别留个后台端口
+            self._player_pane.shutdown()
         self.cfg["split"] = self._layout_sizes()
         self.cfg["window"] = {
             "x": self.x(),

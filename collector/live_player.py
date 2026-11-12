@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -43,6 +44,9 @@ PLAY_URL = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInf
 # 清晰度档位：数字是 B 站的 qn，高的排前面，取流时按「用户想要 → 实际能给」降级
 QN_CHOICES = [(10000, "原画"), (400, "蓝光"), (250, "超清"), (150, "高清"), (80, "流畅")]
 QN_LABELS = dict(QN_CHOICES)
+
+# 断流后自动重连的次数上限，用完就退回「未连接」，等人再点
+MAX_RETRIES = 5
 
 # 播放列表里要改写的地方：裸 URI 行，和 #EXT-X-MAP / #EXT-X-KEY 里的 URI="..."
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
@@ -365,46 +369,65 @@ class _FetchTask(QRunnable):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
-# ----- 播放窗口 -----
+# ----- 直播画面栏 -----
 
 
-class LivePlayerWindow(QWidget):
-    """独立的播放窗口：一块画面 + 一行控制条。
+def _repolish(widget) -> None:
+    """改过 property 之后要让 QSS 重新算一遍，否则样式不跟着变。"""
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
 
-    单独开窗而不是塞进主窗口，是为了能一边挂着直播一边看弹幕面板；
-    窗口自己记住大小位置，下次打开还在这。
+
+class LivePlayerPane(QWidget):
+    """直播画面栏：一块画面 + 一行控制条，嵌在弹幕机左边。
+
+    「连接 / 断开」是同一个按钮的两种状态：连接 = 取流并播放，断开 = 停掉，
+    只停画面，不动弹幕那一路。断流、出错会自己重连几次，次数用完就退回
+    「未连接」，等人再点一次，不会一直空转。
+
+    单独开窗的版本已经没有了：画面和弹幕放在一个窗口里，看的时候不用来回切。
     """
 
-    def __init__(self, sender, room_id: int, cfg: dict, theme: str = "dark", save_config=None):
-        super().__init__(None)
+    state_changed = Signal(bool)  # True=正在播（含连接中），False=已断开
+
+    def __init__(
+        self,
+        sender,
+        cfg: dict,
+        room_provider=None,
+        save_config=None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
         self.sender = sender
-        self.room_id = int(room_id or 0)
         self.cfg = cfg
-        self.theme = theme
+        self._room_provider = room_provider
         self._save_config = save_config
+        self.room_id = 0
         self._pool = QThreadPool.globalInstance()
         self._proxy: StreamProxy | None = None
         self._stream: dict | None = None
         self._task: _FetchTask | None = None
+        self._active = False          # 用户想不想看：连接/断开的唯一真值
         self._retries = 0
         self._stalled = 0
-        self._paused_by_user = False
+        self._full_host: QWidget | None = None
+        self._home: tuple | None = None
+        self._home_sizes: list[int] | None = None
 
-        self.setWindowTitle(f"直播画面 · {self.room_id}")
-        self.setWindowFlag(Qt.Window, True)
-        self.setAttribute(Qt.WA_DeleteOnClose, False)
-        self.setMinimumSize(360, 240)
+        self.setObjectName("playerpane")
+        self.setMinimumWidth(300)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self._build()
-        self._restore_geometry()
-        self._apply_theme()
 
-        # 播放器出错 / 流断了：先自己重连几次，真的不行再报到界面上
         self._retry_timer = QTimer(self)
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._reconnect)
 
-        self.open_room(self.room_id)
+        self._sync_connect()
 
     # ----- 界面 -----
 
@@ -414,126 +437,166 @@ class LivePlayerWindow(QWidget):
         outer.setSpacing(0)
 
         self.video = QVideoWidget(self)
-        self.video.setMinimumSize(QSize(320, 180))
+        self.video.setMinimumSize(QSize(200, 120))
         outer.addWidget(self.video, 1)
 
         bar = QWidget(self)
         bar.setObjectName("playerbar")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(8)
+        row.setContentsMargins(8, 5, 8, 5)
+        row.setSpacing(6)
+
+        # 连接 / 断开：一个按钮两种状态，和主控那排的连接按钮同一套配色
+        self.connect_btn = QPushButton("连接")
+        self.connect_btn.setObjectName("primary")
+        self.connect_btn.setProperty("active", "false")
+        self.connect_btn.setCursor(Qt.PointingHandCursor)
+        self.connect_btn.clicked.connect(self._toggle_connect)
+        row.addWidget(self.connect_btn)
 
         self.play_btn = QPushButton("暂停")
         self.play_btn.setCursor(Qt.PointingHandCursor)
+        self.play_btn.setToolTip("直播不能倒回去，再播从最新画面接上")
         self.play_btn.clicked.connect(self._toggle_pause)
         row.addWidget(self.play_btn)
 
-        vol_label = QLabel("音量")
-        row.addWidget(vol_label)
+        state = self._saved()
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
-        self.vol_slider.setFixedWidth(84)
-        self.vol_slider.setValue(80)
+        self.vol_slider.setFixedWidth(66)
+        self.vol_slider.setValue(max(0, min(100, int(state.get("vol", 80) or 0))))
+        self.vol_slider.setToolTip("音量")
         self.vol_slider.valueChanged.connect(self._on_volume)
+        self.vol_slider.sliderReleased.connect(self._remember)
         row.addWidget(self.vol_slider)
 
         self.qn_box = QComboBox()
         for _, label in QN_CHOICES:
             self.qn_box.addItem(label)
-        self.qn_box.setToolTip("切换清晰度会重新取一次流")
+        self.qn_box.setFixedWidth(62)
+        self.qn_box.setToolTip("清晰度，切换会重新取一次流")
+        try:
+            qn_index = int(state.get("qn", 0) or 0)
+        except (TypeError, ValueError):
+            qn_index = 0
+        self.qn_box.setCurrentIndex(max(0, min(qn_index, len(QN_CHOICES) - 1)))
         self.qn_box.currentIndexChanged.connect(self._on_quality)
         row.addWidget(self.qn_box)
 
-        self.status = QLabel("准备中…")
+        self.status = QLabel("未连接")
         self.status.setObjectName("playerstatus")
-        self.status.setSizePolicy(self.status.sizePolicy().horizontalPolicy(), self.status.sizePolicy().verticalPolicy())
+        # 状态字只占零头：窄的时候先让位给按钮
+        self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status.setMinimumWidth(0)
         row.addWidget(self.status, 1)
 
-        self.retry_btn = QPushButton("重连")
-        self.retry_btn.clicked.connect(self._reconnect)
-        row.addWidget(self.retry_btn)
-
         self.full_btn = QPushButton("全屏")
+        self.full_btn.setCursor(Qt.PointingHandCursor)
+        self.full_btn.setToolTip("全屏看画面（Esc / F 退出）")
         self.full_btn.clicked.connect(self._toggle_full)
         row.addWidget(self.full_btn)
 
         outer.addWidget(bar, 0)
         self._bar = bar
 
-        # 播放器本体
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
-        self.audio.setVolume(0.8)
+        self.audio.setVolume(self.vol_slider.value() / 100)
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video)
         self.player.errorOccurred.connect(self._on_error)
         self.player.mediaStatusChanged.connect(self._on_status)
 
-        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._toggle_pause)
-        QShortcut(QKeySequence("F"), self, activated=self._toggle_full)
-        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._exit_full)
+    def _saved(self) -> dict:
+        state = self.cfg.get("player")
+        return state if isinstance(state, dict) else {}
 
-    def _apply_theme(self) -> None:
-        dark = self.theme != "light"
-        bg = "#111317" if dark else "#f2f4f7"
-        fg = "#e8ecf2" if dark else "#1c2026"
-        bar_bg = "#181a1e" if dark else "#ffffff"
-        line = "rgba(255,255,255,28)" if dark else "#dfe4ea"
-        self.setStyleSheet(
-            f"""
-            QWidget{{background:{bg};color:{fg};font-size:12px;}}
-            QWidget#playerbar{{background:{bar_bg};border-top:1px solid {line};}}
-            QPushButton{{
-                background:transparent;border:1px solid {line};border-radius:6px;
-                padding:3px 10px;color:{fg};
-            }}
-            QPushButton:hover{{border-color:#7b8798;}}
-            QLabel#playerstatus{{color:{'#9aa4b2' if dark else '#5c6673'};}}
-            QComboBox{{background:transparent;border:1px solid {line};border-radius:6px;padding:2px 6px;}}
-            QComboBox QAbstractItemView{{background:{bar_bg};color:{fg};border:1px solid {line};}}
-            QSlider::groove:horizontal{{height:3px;background:{line};border-radius:2px;}}
-            QSlider::handle:horizontal{{width:10px;height:10px;margin:-4px 0;border-radius:5px;background:#7b8798;}}
-            """
-        )
-
-    def _restore_geometry(self) -> None:
-        geo = self.cfg.get("player") if isinstance(self.cfg.get("player"), dict) else {}
-        w = int(geo.get("w") or 960)
-        h = int(geo.get("h") or 540)
-        self.resize(max(360, w), max(240, h))
-        if geo.get("x") is not None and geo.get("y") is not None:
-            self.move(int(geo["x"]), int(geo["y"]))
-
-    def _save_geometry(self) -> None:
-        self.cfg["player"] = {
-            "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(),
-            "qn": self.qn_box.currentIndex(),
-        }
+    def _remember(self) -> None:
+        """清晰度、音量落盘（嵌进主窗口后不再记窗口位置）。"""
+        state = dict(self._saved())
+        state.update({"qn": self.qn_box.currentIndex(), "vol": self.vol_slider.value()})
+        self.cfg["player"] = state
         if self._save_config:
             self._save_config()
 
-    # ----- 取流 / 播放 -----
+    # ----- 连接 / 断开 -----
 
-    def open_room(self, room_id: int) -> None:
-        """换房间（或者首次打开）：重新取流。"""
-        self.room_id = int(room_id or 0)
-        self.setWindowTitle(f"直播画面 · {self.room_id}")
-        if not self.room_id:
+    def _toggle_connect(self) -> None:
+        if self._active:
+            self.disconnect_stream()
+        else:
+            self.connect_stream()
+
+    def connect_stream(self, room_id: int | None = None) -> None:
+        """连上（或者重连）这个房间的画面。"""
+        room = int(room_id or self.room_id or 0)
+        if not room and self._room_provider is not None:
+            try:
+                room = int(self._room_provider() or 0)
+            except Exception:  # noqa: BLE001 - 取不到就当没房间
+                room = 0
+        if not room:
             self._set_status("没有房间号")
             return
+        self.room_id = room
+        self._active = True
         self._retries = 0
+        self._stalled = 0
+        self._sync_connect()
         self._fetch()
+
+    def disconnect_stream(self, reason: str = "已断开") -> None:
+        """停掉画面。弹幕那一路完全不受影响。"""
+        self._active = False
+        self._retry_timer.stop()
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self._stream = None
+        self._set_status(reason)
+        self._sync_connect()
+
+    def is_streaming(self) -> bool:
+        return self._active
+
+    def show_room(self, room_id: int, autoplay: bool = True) -> None:
+        """画面栏被拉开时叫一次：换房间就重取，没在播就顺手连上。"""
+        room = int(room_id or 0)
+        if room and room != self.room_id:
+            self.room_id = room
+            if self._active:
+                self.player.stop()
+                self._fetch()
+                return
+        if autoplay and not self._active:
+            self.connect_stream(room)
 
     def set_sender(self, sender) -> None:
         """换账号：代理里存着 cookie，请求头得跟着换，所以代理整个重建。"""
         if sender is self.sender:
             return
         self.sender = sender
-        self.player.stop()
         if self._proxy is not None:
             self._proxy.close()
             self._proxy = None
-        self._fetch()
+        if self._active:
+            self.player.stop()
+            self._fetch()
+        else:
+            self._set_status("未连接")
+
+    def _sync_connect(self) -> None:
+        on = self._active
+        self.connect_btn.setText("断开" if on else "连接")
+        self.connect_btn.setProperty("active", "true" if on else "false")
+        _repolish(self.connect_btn)
+        self.connect_btn.setToolTip(
+            "停掉画面（弹幕照常收）" if on else "取这个房间的直播流并播放，不打开直播间网页"
+        )
+        self.play_btn.setEnabled(on)
+        self.qn_box.setEnabled(on)
+        self.state_changed.emit(on)
+
+    # ----- 取流 / 播放 -----
 
     def _current_qn(self) -> int:
         index = max(0, min(self.qn_box.currentIndex(), len(QN_CHOICES) - 1))
@@ -548,25 +611,31 @@ class LivePlayerWindow(QWidget):
         self._pool.start(task)
 
     def _on_fetched(self, stream: dict) -> None:
+        if not self._active:  # 取流途中被断开了
+            return
         self._stream = stream
         if self._proxy is None:
-            # 代理的请求头跟着账号走：换账号就重建一个窗口，不折腾热切换
-            self._proxy = StreamProxy(self.sender._headers(f"https://live.bilibili.com/{self.room_id}"))
-        local = self._proxy.url_for(stream["url"])
-        self.player.setSource(QUrl(local))
+            self._proxy = StreamProxy(
+                self.sender._headers(f"https://live.bilibili.com/{self.room_id}")
+            )
+        self.player.setSource(QUrl(self._proxy.url_for(stream["url"])))
         self.player.play()
-        self._paused_by_user = False
         self.play_btn.setText("暂停")
         self._set_status(f"{stream['qn_label']} · 连接中…")
 
     def _on_fetch_failed(self, message: str) -> None:
+        if not self._active:
+            return
         self._set_status(message)
-        # 未开播、接口报错这类问题重试也没用，别空转
-        if "没在播" in message:
+        # 没开播、没有可用流这类问题重试也没用，直接退回「未连接」
+        if "没在播" in message or "没有可用" in message:
+            self.disconnect_stream(message)
             return
         self._schedule_retry()
 
     def _on_status(self, status) -> None:
+        if not self._active:
+            return
         if status == QMediaPlayer.MediaStatus.BufferedMedia:
             self._retries = 0
             self._stalled = 0
@@ -579,23 +648,23 @@ class LivePlayerWindow(QWidget):
             if self._stalled >= 6:
                 self._stalled = 0
                 self._schedule_retry()
-        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
-            # 直播流的「播完」= 断了
-            self._schedule_retry()
-        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+        elif status in (
+            QMediaPlayer.MediaStatus.EndOfMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        ):
             self._schedule_retry()
 
     def _on_error(self, error, message: str) -> None:
-        if error == QMediaPlayer.Error.NoError:
+        if error == QMediaPlayer.Error.NoError or not self._active:
             return
         self._set_status(f"播放出错：{message or '未知原因'}")
         self._schedule_retry()
 
     def _schedule_retry(self) -> None:
-        if self._retry_timer.isActive():
+        if not self._active or self._retry_timer.isActive():
             return
-        if self._retries >= 5:
-            self._set_status("重连多次失败，点「重连」再试")
+        if self._retries >= MAX_RETRIES:
+            self.disconnect_stream("连接失败，点「连接」再试")
             return
         self._retries += 1
         delay = min(2 + self._retries * 2, 10)
@@ -603,6 +672,8 @@ class LivePlayerWindow(QWidget):
         self._retry_timer.start(delay * 1000)
 
     def _reconnect(self) -> None:
+        if not self._active:
+            return
         self.player.stop()
         # 上游地址有时效（一般几小时），重连一律重新取一遍
         self._fetch()
@@ -610,14 +681,14 @@ class LivePlayerWindow(QWidget):
     # ----- 控制 -----
 
     def _toggle_pause(self) -> None:
+        if not self._active:
+            return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self._paused_by_user = True
             self.play_btn.setText("播放")
             self._set_status("已暂停")
         else:
             # 直播不能「继续播」太久之前的画面，暂停后再播直接从最新处接上
-            self._paused_by_user = False
             self.player.play()
             self.play_btn.setText("暂停")
 
@@ -625,39 +696,66 @@ class LivePlayerWindow(QWidget):
         self.audio.setVolume(value / 100)
 
     def _on_quality(self, _index: int) -> None:
-        if self._stream is None:
-            return
-        self._reconnect()
-
-    def _toggle_full(self) -> None:
-        if self.isFullScreen():
-            self._exit_full()
-        else:
-            self._bar.hide()
-            self.showFullScreen()
-
-    def _exit_full(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
-            self._bar.show()
+        self._remember()
+        if self._active:
+            self._reconnect()
 
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
+        self.status.setToolTip(text)
 
-    # ----- 生命周期 -----
+    # ----- 全屏：把整条画面栏临时搬到一个全屏窗口里 -----
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        self._save_geometry()
-        self._retry_timer.stop()
-        self.player.stop()
-        self.player.setSource(QUrl())
+    def _toggle_full(self) -> None:
+        if self._full_host is not None:
+            self._leave_full()
+        else:
+            self._enter_full()
+
+    def _enter_full(self) -> None:
+        parent = self.parentWidget()
+        index = parent.indexOf(self) if hasattr(parent, "indexOf") else 0
+        sizes = parent.sizes() if hasattr(parent, "sizes") else None
+        self._home = (parent, index)
+        self._home_sizes = list(sizes) if sizes else None
+
+        host = QWidget(None, Qt.Window)
+        host.setWindowTitle("直播画面")
+        host.setAttribute(Qt.WA_DeleteOnClose, False)
+        box = QVBoxLayout(host)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+
+        self.setParent(host)
+        box.addWidget(self)          # 画面栏带着控制条一起进全屏
+        self._full_host = host
+        self.full_btn.setText("退出全屏")
+
+        QShortcut(QKeySequence(Qt.Key_Escape), host, activated=self._leave_full)
+        QShortcut(QKeySequence("F"), host, activated=self._leave_full)
+        host.showFullScreen()
+        self.play_btn.setFocus()
+
+    def _leave_full(self) -> None:
+        host, self._full_host = self._full_host, None
+        if host is None:
+            return
+        parent, index = self._home or (None, 0)
+        host.layout().removeWidget(self)
+        self.setParent(parent)
+        if hasattr(parent, "insertWidget"):
+            parent.insertWidget(index, self)
+        if self._home_sizes and hasattr(parent, "setSizes"):
+            parent.setSizes(self._home_sizes)
+        self.show()
+        self.full_btn.setText("全屏")
+        host.close()
+        host.deleteLater()
+
+    # ----- 收尾 -----
+
+    def shutdown(self) -> None:
+        self.disconnect_stream()
         if self._proxy is not None:
             self._proxy.close()
             self._proxy = None
-        super().closeEvent(event)
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        if event.key() == Qt.Key_Escape:
-            self._exit_full()
-            return
-        super().keyPressEvent(event)
