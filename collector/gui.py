@@ -2942,7 +2942,9 @@ class FloatingWindow(QWidget):
         self._queue_geometry_save()
 
     def _toggle_topmost(self) -> None:
-        self._set_topmost(not self.pin_btn.isChecked())
+        # 按钮是 checkable：clicked 到这儿的时候勾选状态已经翻过了，
+        # 直接照当前状态来；再取一次反会把按钮自己翻回去，等于点不动
+        self._set_topmost(self.pin_btn.isChecked())
 
     def _set_topmost(self, on: bool) -> None:
         if self.pin_btn.isChecked() != on:
