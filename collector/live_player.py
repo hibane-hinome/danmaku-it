@@ -48,6 +48,9 @@ QN_LABELS = dict(QN_CHOICES)
 # 断流后自动重连的次数上限，用完就退回「未连接」，等人再点
 MAX_RETRIES = 5
 
+# 取流时最多试几条线路（B 站同一路流会给多个 CDN host，有的会 403）
+MAX_PROBES = 12
+
 # 播放列表里要改写的地方：裸 URI 行，和 #EXT-X-MAP / #EXT-X-KEY 里的 URI="..."
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
 
@@ -100,48 +103,85 @@ def fetch_stream(sender, room_id: int, qn: int = 10000) -> dict:
     if not streams:
         raise PlayerError("这个直播间没有可用的流（可能需要登录，或者只有付费画质）")
 
-    # 先把所有候选摊平：HLS 排前面，同一协议里 fmp4 优先（avc 比 hevc 兼容性好）
-    candidates: list[tuple[int, int, dict, str]] = []
+    # 先把所有候选摊平。FLV 排前面：B 站给的 HLS 线路经常整条 403（实测同一时间
+    # FLV 能拉、HLS 两条 host 全拒），FLV 反而是最稳的那条；HLS 留着兜底。
+    candidates: list[tuple[float, int, str]] = []
     for stream in streams:
         proto = stream.get("protocol_name") or ""
         for fmt in stream.get("format") or []:
             name = fmt.get("format_name") or ""
             for codec in fmt.get("codec") or []:
-                full = _join_url(codec)
-                if not full:
-                    continue
-                rank = 0 if proto == "http_hls" else 2
-                if name == "fmp4":
-                    rank -= 1
+                if proto == "http_hls":
+                    rank = 1.0 + (0.0 if name == "fmp4" else 0.2)
+                else:
+                    rank = 0.0
                 if (codec.get("codec_name") or "") == "avc":
-                    rank -= 0.5
-                candidates.append((rank, int(codec.get("current_qn") or 0), codec, full))
+                    rank -= 0.1
+                got_qn = int(codec.get("current_qn") or 0)
+                for full in _join_urls(codec):
+                    candidates.append((rank, got_qn, full))
     if not candidates:
         raise PlayerError("取到了直播信息但里面没有可用地址")
 
     candidates.sort(key=lambda item: (item[0], -item[1]))
-    _, got_qn, _, src = candidates[0]
-    return {
-        "url": src,
-        "qn": got_qn,
-        "qn_label": QN_LABELS.get(got_qn, str(got_qn)),
-        "kind": "hls" if src.split("?")[0].endswith(".m3u8") else "flv",
-        "title": data.get("room_id") and (data.get("title") or ""),
-    }
+
+    # B 站同一路流会给好几条 CDN 线路（url_info 里一个 host 对应一个 extra），
+    # 排前面的那条未必能连——实测经常是第一条 403、第二条才通，所以挨个探一下，
+    # 第一个真能拉到数据的就用。探不通就报出来，别让播放器对着 403 干等。
+    headers = sender._headers(f"https://live.bilibili.com/{room_id}")
+    last_error = ""
+    seen: set[str] = set()
+    probed = 0
+    for _, got_qn, src in candidates:
+        if src in seen:
+            continue
+        seen.add(src)
+        probed += 1
+        if probed > MAX_PROBES:
+            break
+        ok, reason = _probe(src, headers)
+        if not ok:
+            last_error = reason
+            continue
+        return {
+            "url": src,
+            "qn": got_qn,
+            "qn_label": QN_LABELS.get(got_qn, str(got_qn)),
+            "kind": "hls" if src.split("?")[0].endswith(".m3u8") else "flv",
+            "title": data.get("room_id") and (data.get("title") or ""),
+        }
+    raise PlayerError(f"直播线路都连不上（{last_error or '无响应'}）")
 
 
-def _join_url(codec: dict) -> str:
-    """把 base_url + host + extra 拼成完整地址（B 站这套结构就是这么绕）。"""
+def _probe(url: str, headers: dict[str, str]) -> tuple[bool, str]:
+    """试一下这条线路给不给数据：只要开头几个字节，别真把流拉下来。"""
+    try:
+        req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-1023"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read(64)
+        return True, ""
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, type(exc).__name__
+
+
+def _join_urls(codec: dict) -> list[str]:
+    """一把地址全拼出来：base_url 配每一个 host（每条的 extra 各自不同）。"""
     base = codec.get("base_url") or ""
     if not base:
-        return ""
+        return []
     infos = codec.get("url_info") or []
     if not infos:
-        return base
-    info = infos[0]
-    host = (info.get("host") or "").rstrip("/")
-    extra = info.get("extra") or ""
-    return f"{host}{base}{('?' + extra) if extra else ''}"
+        return [base]
+    urls = []
+    for info in infos:
+        host = (info.get("host") or "").rstrip("/")
+        extra = info.get("extra") or ""
+        url = f"{host}{base}{('?' + extra) if extra else ''}"
+        if url not in urls:
+            urls.append(url)
+    return urls
 
 
 # ----- 本地代理 -----
@@ -199,8 +239,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _serve_playlist(self, target: str) -> None:
         try:
             body = self._fetch(target)
-        except PlayerError as exc:
-            self.send_error(502, str(exc))
+        except PlayerError:
+            # send_error 的文本走 latin-1，中文会直接把处理线程炸掉，这里只说英文
+            self.send_error(502, "upstream playlist error")
             return
         text = body.decode("utf-8", "replace")
         base = target
@@ -404,6 +445,7 @@ class LivePlayerPane(QWidget):
         self._task: _FetchTask | None = None
         self._active = False          # 该不该有画面：由弹幕机的连接状态决定
         self._live_room = 0           # 当前这条流属于哪个房间
+        self._playing_reported = False  # 状态栏有没有已经报过「播放中」
         self._retries = 0
         self._stalled = 0
         self._full_host: QWidget | None = None
@@ -508,6 +550,7 @@ class LivePlayerPane(QWidget):
         self.player.setVideoOutput(self.video)
         self.player.errorOccurred.connect(self._on_error)
         self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.playbackStateChanged.connect(self._on_play_state)
 
     def _saved(self) -> dict:
         state = self.cfg.get("player")
@@ -561,6 +604,7 @@ class LivePlayerPane(QWidget):
         self._active = True
         self._retries = 0
         self._stalled = 0
+        self._playing_reported = False
         self._sync_controls()
         self.player.stop()  # 换房间时先停旧的，别让两路流打架
         self._fetch()
@@ -569,6 +613,7 @@ class LivePlayerPane(QWidget):
         """停掉画面。"""
         self._active = False
         self._live_room = 0
+        self._playing_reported = False
         self._retry_timer.stop()
         self.player.stop()
         self.player.setSource(QUrl())
@@ -586,6 +631,7 @@ class LivePlayerPane(QWidget):
             return
         self._retries = 0
         self._stalled = 0
+        self._playing_reported = False
         self._retry_timer.stop()
         self.player.stop()
         self._fetch()
@@ -667,23 +713,34 @@ class LivePlayerPane(QWidget):
     def _on_status(self, status) -> None:
         if not self._active:
             return
-        if status == QMediaPlayer.MediaStatus.BufferedMedia:
-            self._retries = 0
-            self._stalled = 0
-            qn = (self._stream or {}).get("qn_label", "")
-            self._set_status(f"播放中 · {qn}" if qn else "播放中")
-        elif status == QMediaPlayer.MediaStatus.Stalled:
-            self._set_status("缓冲中…")
-            self._stalled += 1
-            # 直播流卡住超过几次就整条重来，等它自己好基本等不到
-            if self._stalled >= 6:
-                self._stalled = 0
-                self._schedule_retry()
-        elif status in (
-            QMediaPlayer.MediaStatus.EndOfMedia,
-            QMediaPlayer.MediaStatus.InvalidMedia,
-        ):
+        Media = QMediaPlayer.MediaStatus
+        if status == Media.BufferedMedia:
+            self._mark_playing()
+        elif status in (Media.BufferingMedia, Media.StalledMedia):
+            # 已经在播了就别再退回「缓冲中」，直播流动不动卡一下，字眼花
+            if not self._playing_reported:
+                self._set_status("缓冲中…")
+            if status == Media.StalledMedia:
+                self._stalled += 1
+                # 直播流卡住超过几次就整条重来，等它自己好基本等不到
+                if self._stalled >= 6:
+                    self._stalled = 0
+                    self._schedule_retry()
+        elif status in (Media.EndOfMedia, Media.InvalidMedia):
             self._schedule_retry()
+
+    def _mark_playing(self) -> None:
+        self._retries = 0
+        self._stalled = 0
+        self._playing_reported = True
+        qn = (self._stream or {}).get("qn_label", "")
+        self._set_status(f"播放中 · {qn}" if qn else "播放中")
+
+    def _on_play_state(self, state) -> None:
+        # 直播流有时不给 BufferedMedia，光靠 mediaStatus 会一直停在「连接中」
+        if state == QMediaPlayer.PlaybackState.PlayingState and self._active:
+            if not self._playing_reported:
+                self._mark_playing()
 
     def _on_error(self, error, message: str) -> None:
         if error == QMediaPlayer.Error.NoError or not self._active:
