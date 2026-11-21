@@ -36,13 +36,11 @@
 
 ## 依赖安装
 
-项目自带虚拟环境，位于 `.venv`，依赖已装好，日常无需再执行安装。
-
-如需重建（Python 3.10+，本机 `D:\Dev\Python\x64\3.13.7\python.exe`）：
+需要 Python 3.10+，首次使用装一次依赖：
 
 ```powershell
-cd D:\HibaneHinome\danmaku-it
-& "D:\Dev\Python\x64\3.13.7\python.exe" -m venv .venv
+cd danmaku-it
+python -m venv .venv
 & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
 ```
 
@@ -50,18 +48,18 @@ cd D:\HibaneHinome\danmaku-it
 
 ## 配置
 
-`config.json` **不入库**（含 cookie 路径与本机窗口状态），首次使用从模板复制：
+`config.json` **不入库**（含 cookie 路径与窗口状态），首次使用从模板复制：
 
 ```bash
 cp config.example.json config.json
 ```
 
-模板里 `database` 用相对路径指向同一工作区的归档库，`rooms` 换成要采集的直播间：
+模板里 `database` 指向要写入的 SQLite 库文件，`rooms` 换成要采集的直播间：
 
 ```json
 {
   "rooms": [22748536],
-  "database": "../live-archive/.data/translation_history.db",
+  "database": "data/sc.db",
   "log_file": "logs/collector.log",
   "cookie_dir": "accounts",
   "log_level": "INFO",
@@ -86,7 +84,7 @@ cp config.example.json config.json
 双击 `gui.bat`，或：
 
 ```powershell
-cd D:\HibaneHinome\danmaku-it
+cd danmaku-it
 & ".\.venv\Scripts\python.exe" -m collector gui -c config.json
 ```
 
@@ -201,22 +199,22 @@ GUI 与命令行共用同一份 `config.json` 和同一个 SQLite 库，可以�
 ### 命令行（常驻采集）
 
 ```powershell
-cd D:\HibaneHinome\danmaku-it
+cd danmaku-it
 & ".\.venv\Scripts\python.exe" -m collector run -c config.json
 ```
 
 后台常驻（无窗口）：
 
 ```powershell
-D:\HibaneHinome\danmaku-it\run.bat
+.\run.bat
 ```
 
 或手动：
 
 ```powershell
-Start-Process -FilePath "D:\HibaneHinome\danmaku-it\.venv\Scripts\pythonw.exe" `
-  -ArgumentList "-m","collector","run","-c","D:\HibaneHinome\danmaku-it\config.json" `
-  -WorkingDirectory "D:\HibaneHinome\danmaku-it" -WindowStyle Hidden
+Start-Process -FilePath ".\.venv\Scripts\pythonw.exe" `
+  -ArgumentList "-m","collector","run","-c","config.json" `
+  -WorkingDirectory "." -WindowStyle Hidden
 ```
 
 临时覆盖房间、不修改配置文件：

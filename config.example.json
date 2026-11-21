@@ -1,6 +1,6 @@
 {
   "rooms": [22748536],
-  "database": "../live-archive/.data/translation_history.db",
+  "database": "data/sc.db",
   "log_file": "logs/collector.log",
   "log_level": "INFO",
   "heartbeat_seconds": 30,
